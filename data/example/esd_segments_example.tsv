@@ -1,0 +1,2 @@
+chromosome	start	end	chromosomal_arm	SequencingID	segmented_CN	CaseID	SpecimenID	Specimen_pathology	Sequencingbatch	SequencingID(barcodeonly)	metadatasheet_sample_sequence	Specimenphenotype
+1	850001	900000	chr1p	SLX-DEMO.101	0.050	PARTICIPANT_DEMO_101	SPECIMEN_DEMO_101	Reference	SLX-DEMO	A1	1	0

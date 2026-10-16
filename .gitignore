@@ -1,0 +1,35 @@
+# Participant-derived study data
+data/*
+!data/README.md
+!data/example/
+!data/example/**
+
+# Generated analysis outputs
+results/*
+figures/*
+
+
+# R/RStudio local files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.Renviron
+
+# R Markdown rendered/intermediate outputs
+*.html
+*_files/
+*_cache/
+*.knit.md
+*.utf8.md
+
+# Local environment / credentials
+.env
+.env.*
+.httr-oauth
+.httr-oauth*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.Rproj

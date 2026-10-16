@@ -1,0 +1,4731 @@
+---
+title: "Capsule Sponge Copy-Number and Diagnostic Modelling Analysis"
+date: "2026-07-09"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+# Overview
+
+This R Markdown document reproduces the main capsule sponge copy-number analyses, diagnostic modelling, sensitivity analyses, and microdissected ESD tissue analyses reported in the  manuscript.
+
+## Data requirements
+
+This analysis requires participant-derived sequencing and clinical data that are
+not distributed with this public code repository. Instructions for obtaining the
+controlled-access datasets and the expected input-file structure are provided in
+`data/README.md`.
+
+
+```{r}
+knitr::opts_chunk$set(
+echo = TRUE,
+message = FALSE,
+warning = FALSE
+)
+set.seed(123)  # For reproducibility
+
+```
+
+```{r}
+# ---- Libraries ----
+suppressPackageStartupMessages({
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(pROC)
+library(rstatix)
+library(ggpubr)
+library(ggsignif)
+library(patchwork)
+library(cowplot)
+library(scales)
+library(fmsb)
+})
+
+```
+
+# 0. Define project structure
+```{r project-structure}
+# This R Markdown file is designed to be run from the project root directory.
+# Expected structure:
+#   data/
+#     capsule_sponge_50kb_segmented.tsv
+#     clinical_metadata.tsv
+#     esd_segments.tsv
+#   results/
+#   figures/
+
+data_dir <- "data"
+results_dir <- "results"
+fig_dir <- "figures"
+tables_dir <- file.path(results_dir, "tables")
+gee_output_dir <- file.path(results_dir, "sensitivity_analyses")
+
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tables_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(gee_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+required_input_files <- c(
+  file.path(data_dir, "capsule_sponge_50kb_segmented.tsv"),
+  file.path(data_dir, "clinical_metadata.tsv"),
+  file.path(data_dir, "esd_segments.tsv")
+)
+
+missing_input_files <- required_input_files[!file.exists(required_input_files)]
+
+if (length(missing_input_files) > 0) {
+  stop(
+    "The following required input files are missing:\n",
+    paste(missing_input_files, collapse = "\n"),
+    "\n\nPlease run this script from the project root directory."
+  )
+}
+
+cat("Input files found:\n")
+print(required_input_files)
+```
+
+```{r}
+# ==============================================================================
+# 1. Load Capsule sponge shallow WGS segment data + metadata
+# ==============================================================================
+
+# 50 kb segmented CN data for Capsule sponge (each row = genomic bin; wide format)
+sponge_CN_50kb_raw <- read_tsv(
+  file.path(data_dir, "capsule_sponge_50kb_segmented.tsv"),
+  col_types = cols()
+) %>%
+  mutate(
+    chromosomal_arm = paste0("chr", chromosomal_arm)
+  ) %>%
+  arrange(chromosome)
+
+# Long format: per-bin CN per sample
+sponge_CN_50kb_long <- sponge_CN_50kb_raw %>%
+  pivot_longer(
+    cols = matches("^SLX"),
+    names_to = "sequencing_ID",
+    values_to = "segmented_CN"
+  )
+
+# Clinical metadata for Capsule sponge libraries/specimens
+clinical_df <- read_tsv(
+  file.path(data_dir, "clinical_metadata.tsv"),
+  col_types = cols()
+) %>%
+  dplyr::select(
+    sequencing_ID,
+    specimen_ID,
+    case_ID,
+    age,
+    sex,
+    bmi,
+    chest_rth,
+    group,
+    smoking_binary,
+    endoscopy_outcome_binarized,
+    endoscopy_outcome_trichotomize,
+    cytosponge_definite_sq_atypia,
+    p53_staining_binarized
+  )
+
+
+# Annotate per-bin CN with specimen-level metadata
+sponge_CN_50kb_long_annot <- sponge_CN_50kb_long %>%
+  inner_join(clinical_df, by = "sequencing_ID") %>%
+  dplyr::select(
+    sequencing_ID,
+    specimen_ID,
+    case_ID,
+    chromosome,
+    start,
+    end,
+    chromosomal_arm,
+    segmented_CN,
+    group,
+    endoscopy_outcome_binarized,
+    endoscopy_outcome_trichotomize
+  ) 
+
+# ==============================================================================
+# 2. Call per-bin alteration status using robust arm-wise control ranges
+#    Threshold = median ± 1.5×IQR within healthy controls
+# ==============================================================================
+
+control_bins <- sponge_CN_50kb_long_annot %>%
+  filter(group == "control")
+
+arm_ref_stats <- control_bins %>%
+  group_by(chromosomal_arm) %>%
+  summarise(
+    median_value = median(segmented_CN, na.rm = TRUE),
+    iqr_value    = IQR(segmented_CN, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    lower_bound = median_value - 1.5 * iqr_value,
+    upper_bound = median_value + 1.5 * iqr_value
+  )
+
+sponge_CN_50kb_long_annot <- sponge_CN_50kb_long_annot %>%
+  left_join(arm_ref_stats, by = "chromosomal_arm") %>%
+  mutate(
+    is_altered = if_else(
+      segmented_CN < lower_bound | segmented_CN > upper_bound,
+      "altered",
+      "normal"
+    ),
+    outcome_tri_category = case_when(
+      endoscopy_outcome_trichotomize == 0   ~ "normal",
+      endoscopy_outcome_trichotomize == 0.5 ~ "benign_conditions",
+      endoscopy_outcome_trichotomize == 1   ~ "IEN_early_cancer"
+    )
+  )
+
+saveRDS(sponge_CN_50kb_long_annot,
+        file.path(results_dir, "capsulesponge_50kb_long_annot.rds"))
+
+# ==============================================================================
+# 3. Genome-wide CNA burden per specimen
+#    - Continuous: proportion of altered genome-wide
+#    - Binary: "High burden" if above 95th percentile of controls
+# ==============================================================================
+
+gw_burden_df <- sponge_CN_50kb_long_annot %>%
+  group_by(specimen_ID, outcome_tri_category, group) %>%
+  summarise(
+    altered_segments = sum(is_altered == "altered"),
+    total_segments   = n(),
+    genome_wide_CNA_burden =
+      altered_segments / total_segments,
+    .groups = "drop"
+  )
+
+control_gw <- gw_burden_df %>%
+  filter(group == "control")
+
+gw_threshold <- quantile(
+  control_gw$genome_wide_CNA_burden,
+  probs = 0.95,
+  na.rm = TRUE
+)
+
+gw_burden_df <- gw_burden_df %>%
+  mutate(
+    genome_wide_CNA_burden_binary = if_else(
+      genome_wide_CNA_burden >= gw_threshold,
+      "High burden",
+      "Low burden"
+    )
+  )
+
+unique(gw_burden_df$outcome_tri_category)
+
+saveRDS(gw_burden_df,
+        file.path(results_dir, "capsulesponge_gw_burden_df.rds"))
+
+# ==============================================================================
+# 4. Aggregate 50 kb bins -> chromosome-arm summaries per specimen
+#    (median log2 relative copy number per arm)
+# ==============================================================================
+
+arm_level_CN <- sponge_CN_50kb_long %>%
+  group_by(sequencing_ID, chromosomal_arm) %>%
+  summarise(
+    segmented_CN = median(segmented_CN, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+arm_level_annot <- arm_level_CN %>%
+  inner_join(clinical_df, by = "sequencing_ID") %>%
+  inner_join(
+    gw_burden_df %>%
+      dplyr::select(
+        specimen_ID,
+        genome_wide_CNA_burden,
+        genome_wide_CNA_burden_binary,
+        outcome_tri_category
+      ),
+    by = "specimen_ID"
+  )
+
+saveRDS(arm_level_annot,
+        file.path(results_dir, "capsulesponge_arm_level_annot.rds"))
+
+# ==============================================================================
+# 5. Figure: Arm-level relative CN across outcome groups
+#    Faceted scatter/jitter by outcome group
+# ==============================================================================
+
+# ---- Factor levels (x-axis order) ----
+arm_order <- c(
+  "chr1p","chr1q","chr2p","chr2q","chr3p","chr3q","chr4p","chr4q",
+  "chr5p","chr5q","chr6p","chr6q","chr7p","chr7q","chr8p","chr8q",
+  "chr9p","chr9q","chr10p","chr10q","chr11p","chr11q","chr12p","chr12q",
+  "chr13q","chr14q","chr15q","chr16p","chr16q","chr17p","chr17q",
+  "chr18p","chr18q","chr19p","chr19q","chr20p","chr20q","chr21q","chr22q"
+)
+
+# ---- Build plotting dataframe ----
+plot_df <- arm_level_annot %>%
+  mutate(
+    chromosomal_arm = factor(chromosomal_arm, levels = arm_order),
+    OutcomeGroup = factor(
+      as.character(endoscopy_outcome_trichotomize),
+      levels = c("0","0.5","1"),
+      labels = c("Normal","Benign","IEN/early cancer")
+    )
+  )
+
+# ---- Aesthetics ----
+cols_outcome <- c(
+  "Normal"           = "#4DAF4A",
+  "Benign"           = "#377EB8",
+  "IEN/early cancer" = "#E41A1C"
+)
+
+thin_every <- 2
+
+x_lab_fun <- function(x) {
+  idx <- seq_along(x)
+  ifelse(idx %% thin_every == 1, x, "")
+}
+
+# ---- Plot ----
+p_armCN <- ggplot(
+  plot_df,
+  aes(
+    x = chromosomal_arm,
+    y = segmented_CN,
+    colour = OutcomeGroup
+  )
+) +
+  geom_hline(yintercept = 0, colour = "grey35", linewidth = 0.9) +
+  geom_point(
+    alpha = 0.55,
+    size = 1.2,
+    position = position_jitter(width = 0.18, height = 0, seed = 123)
+  ) +
+  facet_grid(. ~ OutcomeGroup, scales = "fixed") +
+  scale_colour_manual(values = cols_outcome, guide = "none") +
+  scale_x_discrete(drop = FALSE, labels = x_lab_fun) +
+  scale_y_continuous(
+    limits = c(-0.5, 0.5),
+    breaks = seq(-0.5, 0.5, 0.25),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(x = "Chromosome arm", y = "Relative copy number") +
+  theme_bw(base_size = 13) +
+theme(
+  panel.grid.major.y = element_line(colour = "grey88", linewidth = 0.45),
+  panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.35),
+  panel.grid.minor   = element_blank(),
+  panel.border       = element_blank(),
+  panel.spacing.x    = unit(0.6, "lines"),
+  axis.line          = element_line(colour = "black", linewidth = 0.6),
+  axis.title         = element_text(face = "bold", size = 13),
+  axis.text.y        = element_text(face = "bold", size = 12),
+  axis.text.x        = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1,
+    face = "bold",
+    size = 12
+  ),
+  strip.background   = element_blank(),
+  strip.text         = element_text(face = "bold", size = 12)
+)
+
+print(p_armCN)
+
+# ---- Save (PDF + PNG) ----
+ggsave(
+  file.path(fig_dir, "Figure_2A.pdf"),
+  p_armCN,
+  width = 13.5,
+  height = 4.2,
+  units = "in",
+  dpi = 600,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "Figure_2A.png"),
+  p_armCN,
+  width = 13.5,
+  height = 4.2,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+# ==============================================================================
+# 6. Genome-wide CNA burden visualisation:
+#    (A) violin/boxplot + Kruskal-Wallis + Dunn
+#    (B) horizontal bar plot of % High burden per group
+# ==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+library(readr)
+library(rstatix)
+library(ggpubr)
+library(patchwork)
+library(cowplot)
+
+# ------------------------------------------------------------------------------
+# 6.1 Prepare plotting/statistics dataframe
+# ------------------------------------------------------------------------------
+
+diagnostic_labels <- c(
+  "Normal",
+  "Benign",
+  "IEN/early cancer"
+)
+
+standardise_outcome_tri <- function(x) {
+  dplyr::case_when(
+    as.character(x) %in% c("normal", "Normal") ~ "Normal",
+    as.character(x) %in% c("benign_conditions", "Benign") ~ "Benign",
+    as.character(x) %in% c("IEN_early_cancer", "IEN/early cancer") ~ "IEN/early cancer",
+    TRUE ~ NA_character_
+  )
+}
+
+burden_plot_df <- gw_burden_df %>%
+  mutate(
+    OutcomeGroup = standardise_outcome_tri(outcome_tri_category),
+    OutcomeGroup = factor(
+      OutcomeGroup,
+      levels = diagnostic_labels
+    ),
+    genome_wide_CNA_burden_binary = factor(
+      genome_wide_CNA_burden_binary,
+      levels = c("Low burden", "High burden")
+    )
+  )
+
+# Add case_ID if gw_burden_df does not already contain it
+if (!"case_ID" %in% names(burden_plot_df)) {
+  burden_plot_df <- burden_plot_df %>%
+    left_join(
+      clinical_df %>%
+        distinct(specimen_ID, case_ID),
+      by = "specimen_ID"
+    )
+}
+
+cols_groups <- c(
+  "Normal" = "#4DAF4A",
+  "Benign" = "#377EB8",
+  "IEN/early cancer" = "#E41A1C"
+)
+
+order_lvls <- levels(burden_plot_df$OutcomeGroup)
+
+cat("\n--- GW-CNA burden scroll-set counts ---\n")
+print(table(burden_plot_df$OutcomeGroup, useNA = "ifany"))
+
+if (any(is.na(burden_plot_df$OutcomeGroup))) {
+  stop("Some outcome_tri_category values did not map to OutcomeGroup. Check unique(gw_burden_df$outcome_tri_category).")
+}
+
+# ------------------------------------------------------------------------------
+# 6.2 Use existing binary GW-CNA burden threshold
+# ------------------------------------------------------------------------------
+
+# gw_threshold was calculated earlier as the 95th percentile of GW-CNA burden
+# in healthy/control samples.
+if (!exists("gw_threshold")) {
+  stop("gw_threshold does not exist. Please calculate it earlier before running Section 6.")
+}
+
+thr_line <- as.numeric(gw_threshold)
+
+cat("\n--- GW-CNA burden threshold, 95th percentile of healthy/control samples ---\n")
+print(thr_line)
+
+cat("\n--- Binary GW-CNA burden counts ---\n")
+print(table(burden_plot_df$OutcomeGroup, burden_plot_df$genome_wide_CNA_burden_binary))
+
+# ------------------------------------------------------------------------------
+# 6.3 Summary statistics
+# ------------------------------------------------------------------------------
+
+gw_burden_summary <- burden_plot_df %>%
+  group_by(OutcomeGroup) %>%
+  summarise(
+    n_scrollsets = n(),
+    n_patients = n_distinct(case_ID),
+    median_burden = median(genome_wide_CNA_burden, na.rm = TRUE),
+    mean_burden = mean(genome_wide_CNA_burden, na.rm = TRUE),
+    q1_burden = quantile(genome_wide_CNA_burden, 0.25, na.rm = TRUE),
+    q3_burden = quantile(genome_wide_CNA_burden, 0.75, na.rm = TRUE),
+    iqr_burden = IQR(genome_wide_CNA_burden, na.rm = TRUE),
+    min_burden = min(genome_wide_CNA_burden, na.rm = TRUE),
+    max_burden = max(genome_wide_CNA_burden, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+gw_burden_summary_for_text <- gw_burden_summary %>%
+  mutate(
+    median_iqr_text = sprintf(
+      "%.3f [%.3f]",
+      median_burden,
+      iqr_burden
+    ),
+    q1_q3_text = sprintf(
+      "%.3f–%.3f",
+      q1_burden,
+      q3_burden
+    )
+  )
+
+cat("\n--- GW-CNA burden summary by diagnostic group ---\n")
+print(gw_burden_summary_for_text, n = Inf, width = Inf)
+
+# ------------------------------------------------------------------------------
+# 6.4 Kruskal-Wallis test across diagnostic groups
+# ------------------------------------------------------------------------------
+
+kw_burden <- kruskal.test(
+  genome_wide_CNA_burden ~ OutcomeGroup,
+  data = burden_plot_df
+)
+
+kw_burden_tbl <- tibble(
+  test = "Kruskal-Wallis",
+  variable = "genome_wide_CNA_burden",
+  statistic = unname(kw_burden$statistic),
+  df = unname(kw_burden$parameter),
+  p_value = kw_burden$p.value,
+  p_adj_BH = p.adjust(kw_burden$p.value, method = "BH")
+)
+
+cat("\n--- GW-CNA burden Kruskal-Wallis test ---\n")
+print(kw_burden_tbl)
+
+# ------------------------------------------------------------------------------
+# 6.5 Dunn post-hoc tests with BH/FDR adjustment
+# ------------------------------------------------------------------------------
+
+dunn_burden <- burden_plot_df %>%
+  rstatix::dunn_test(
+    genome_wide_CNA_burden ~ OutcomeGroup,
+    p.adjust.method = "BH"
+  ) %>%
+  mutate(
+    p = as.numeric(p),
+    p.adj = as.numeric(p.adj)
+  )
+
+cat("\n--- GW-CNA burden Dunn post-hoc tests ---\n")
+print(dunn_burden, n = Inf)
+
+dunn_keep <- dunn_burden %>%
+  filter(group1 == "IEN/early cancer" | group2 == "IEN/early cancer") %>%
+  mutate(
+    group1 = if_else(group1 == "IEN/early cancer", group2, group1),
+    group2 = "IEN/early cancer"
+  ) %>%
+  dplyr::select(.y., group1, group2, p.adj, p.adj.signif) %>%
+  arrange(match(group1, c("Normal", "Benign"))) %>%
+  mutate(
+    y.position = c(1.02, 1.07),
+    group1 = factor(group1, levels = order_lvls),
+    group2 = factor(group2, levels = order_lvls)
+  )
+
+# ------------------------------------------------------------------------------
+# 6.6 Binary GW-CNA burden percentages and chi-square test
+# ------------------------------------------------------------------------------
+
+bar_df <- burden_plot_df %>%
+  count(OutcomeGroup, genome_wide_CNA_burden_binary, name = "n") %>%
+  complete(
+    OutcomeGroup,
+    genome_wide_CNA_burden_binary = factor(
+      c("Low burden", "High burden"),
+      levels = c("Low burden", "High burden")
+    ),
+    fill = list(n = 0)
+  ) %>%
+  group_by(OutcomeGroup) %>%
+  mutate(
+    total = sum(n),
+    pct = 100 * n / total
+  ) %>%
+  ungroup()
+
+bar_high_df <- bar_df %>%
+  filter(genome_wide_CNA_burden_binary == "High burden") %>%
+  mutate(
+    group_lab = factor(as.character(OutcomeGroup), levels = order_lvls)
+  ) %>%
+  arrange(group_lab)
+
+cat("\n--- Binary GW-CNA high-burden summary ---\n")
+print(bar_high_df, n = Inf)
+
+binary_tab <- table(
+  burden_plot_df$OutcomeGroup,
+  burden_plot_df$genome_wide_CNA_burden_binary
+)
+
+cat("\n--- Binary GW-CNA burden contingency table ---\n")
+print(binary_tab)
+
+chisq_binary_burden <- chisq.test(binary_tab)
+
+chisq_binary_burden_tbl <- tibble(
+  test = "Chi-square",
+  variable = "genome_wide_CNA_burden_binary",
+  statistic = unname(chisq_binary_burden$statistic),
+  df = unname(chisq_binary_burden$parameter),
+  p_value = chisq_binary_burden$p.value
+)
+
+cat("\n--- Binary GW-CNA burden chi-square test ---\n")
+print(chisq_binary_burden_tbl)
+
+# ------------------------------------------------------------------------------
+# 6.7 Formatted p-values 
+# ------------------------------------------------------------------------------
+
+format_p_for_text <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.001 ~ formatC(p, format = "e", digits = 2),
+    TRUE ~ formatC(p, format = "f", digits = 4)
+  )
+}
+
+kw_burden_for_text <- kw_burden_tbl %>%
+  mutate(
+    p_value_text = format_p_for_text(p_value),
+    p_adj_BH_text = format_p_for_text(p_adj_BH)
+  )
+
+dunn_burden_for_text <- dunn_burden %>%
+  mutate(
+    p_text = format_p_for_text(p),
+    p_adj_text = format_p_for_text(p.adj)
+  ) %>%
+  select(
+    group1,
+    group2,
+    statistic,
+    p,
+    p.adj,
+    p_text,
+    p_adj_text,
+    p.adj.signif
+  )
+
+chisq_binary_burden_for_text <- chisq_binary_burden_tbl %>%
+  mutate(
+    p_value_text = format_p_for_text(p_value)
+  )
+
+cat("\n--- Formatted GW-CNA burden Kruskal-Wallis result ---\n")
+print(kw_burden_for_text)
+
+cat("\n--- Formatted GW-CNA burden Dunn tests ---\n")
+print(dunn_burden_for_text, n = Inf)
+
+cat("\n--- Formatted binary chi-square result ---\n")
+print(chisq_binary_burden_for_text)
+
+# ------------------------------------------------------------------------------
+# 6.8 Panel A: continuous GW-CNA burden
+# ------------------------------------------------------------------------------
+
+p_top <- ggplot(
+  burden_plot_df,
+  aes(
+    x = OutcomeGroup,
+    y = genome_wide_CNA_burden,
+    fill = OutcomeGroup
+  )
+) +
+  geom_hline(
+    yintercept = thr_line,
+    linetype = "dotted",
+    linewidth = 0.6
+  ) +
+  annotate(
+    "text",
+    x = 0.55,
+    y = thr_line + 0.02,
+    label = "GW-CNA threshold (95th percentile of controls)",
+    hjust = 0,
+    size = 3.6,
+    fontface = "italic"
+  ) +
+  geom_violin(
+    trim = TRUE,
+    alpha = 0.70,
+    colour = NA
+  ) +
+  geom_boxplot(
+    width = 0.16,
+    alpha = 0.85,
+    outlier.shape = NA,
+    linewidth = 0.6,
+    colour = "black"
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.45,
+    size = 1.2,
+    colour = "grey25"
+  ) +
+  scale_fill_manual(values = cols_groups, guide = "none") +
+  ggpubr::stat_pvalue_manual(
+    dunn_keep,
+    mapping = aes(
+      x = group1,
+      xend = group2,
+      y = y.position,
+      label = p.adj.signif
+    ),
+    tip.length = 0.01,
+    size = 4,
+    bracket.size = 0.6,
+    inherit.aes = FALSE
+  ) +
+  annotate(
+    "text",
+    x = 1.02,
+    y = 1.06,
+    label = paste0(
+      "Kruskal-Wallis FDR P = ",
+      formatC(kw_burden_tbl$p_adj_BH, format = "e", digits = 2)
+    ),
+    hjust = 0,
+    size = 4.1,
+    fontface = "italic"
+  ) +
+  scale_x_discrete(drop = FALSE, limits = order_lvls) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  coord_cartesian(
+    ylim = c(0, 1.08),
+    clip = "off"
+  ) +
+  labs(
+    x = NULL,
+    y = "Proportion of genome altered",
+    title = "Genome-wide CNA burden (continuous)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_line(colour = "grey88", linewidth = 0.45),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(colour = "black", linewidth = 0.6),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+# ------------------------------------------------------------------------------
+# 6.9 Panel B: percentage high GW-CNA burden
+# ------------------------------------------------------------------------------
+
+p_bot <- ggplot(
+  bar_high_df,
+  aes(
+    x = pct,
+    y = group_lab,
+    fill = OutcomeGroup
+  )
+) +
+  geom_col(
+    width = 0.6,
+    colour = NA
+  ) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", pct)),
+    hjust = -0.15,
+    fontface = "bold",
+    size = 4.1
+  ) +
+  scale_fill_manual(values = cols_groups, guide = "none") +
+  scale_x_continuous(
+    limits = c(0, 100),
+    expand = expansion(mult = c(0, 0.10))
+  ) +
+  labs(
+    x = "% genomically unstable specimens",
+    y = NULL,
+    title = "Genome-wide CNA burden (binary)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey88", linewidth = 0.45),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(colour = "black", linewidth = 0.6),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+# ------------------------------------------------------------------------------
+# 6.10 Combine panels
+# ------------------------------------------------------------------------------
+
+p_top_no_title <- p_top +
+  labs(y = NULL) +
+  theme(
+    axis.title.y = element_blank()
+  )
+
+p_top_canvas <- cowplot::ggdraw(p_top_no_title) +
+  cowplot::draw_label(
+    "Proportion of genome altered",
+    x = -0.03,
+    y = 0.56,
+    angle = 90,
+    fontface = "bold",
+    size = 12
+  )
+
+fig_cna_burden <- p_top_canvas / patchwork::plot_spacer() / p_bot +
+  plot_layout(heights = c(3.2, 0.12, 1))
+
+print(fig_cna_burden)
+
+# ------------------------------------------------------------------------------
+# 6.11 Save figure and statistics outputs
+# ------------------------------------------------------------------------------
+
+ggsave(
+  file.path(fig_dir, "Figure_2B.pdf"),
+  fig_cna_burden,
+  width = 12,
+  height = 9.0,
+  units = "in",
+  dpi = 600,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "Figure_2B.png"),
+  fig_cna_burden,
+  width = 12,
+  height = 9.0,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+readr::write_tsv(
+  gw_burden_summary,
+  file.path(tables_dir, "Figure_2B_GW_CNA_burden_summary_by_group.tsv")
+)
+
+readr::write_csv(
+  gw_burden_summary,
+  file.path(tables_dir, "Figure_2B_GW_CNA_burden_summary_by_group.csv")
+)
+
+readr::write_tsv(
+  kw_burden_tbl,
+  file.path(tables_dir, "Figure_2B_GW_CNA_burden_kruskal_wallis.tsv")
+)
+
+readr::write_csv(
+  kw_burden_tbl,
+  file.path(tables_dir, "Figure_2B_GW_CNA_burden_kruskal_wallis.csv")
+)
+
+readr::write_tsv(
+  dunn_burden,
+  file.path(tables_dir, "Figure_2B_GW_CNA_burden_dunn_tests_BH.tsv")
+)
+
+readr::write_csv(
+  dunn_burden,
+  file.path(tables_dir, "Figure_2B_GW_CNA_burden_dunn_tests_BH.csv")
+)
+
+readr::write_tsv(
+  bar_high_df,
+  file.path(tables_dir, "Figure_2B_GW_CNA_binary_high_burden_summary.tsv")
+)
+
+readr::write_csv(
+  bar_high_df,
+  file.path(tables_dir, "Figure_2B_GW_CNA_binary_high_burden_summary.csv")
+)
+
+readr::write_tsv(
+  chisq_binary_burden_tbl,
+  file.path(tables_dir, "Figure_2B_GW_CNA_binary_chisquare.tsv")
+)
+
+readr::write_csv(
+  chisq_binary_burden_tbl,
+  file.path(tables_dir, "Figure_2B_GW_CNA_binary_chisquare.csv")
+)
+
+# ------------------------------------------------------------------------------
+# 6.12 Final printed values 
+# ------------------------------------------------------------------------------
+
+cat("\n============================================================\n")
+cat("Final GW-CNA burden results \n")
+cat("============================================================\n\n")
+
+cat("--- GW-CNA burden summary by group ---\n")
+print(gw_burden_summary_for_text, n = Inf)
+
+cat("\n--- Threshold ---\n")
+cat("95th percentile of controls =", sprintf("%.6f", thr_line), "\n")
+
+cat("\n--- Kruskal-Wallis test ---\n")
+print(kw_burden_for_text)
+
+cat("\n--- Dunn post-hoc tests ---\n")
+print(dunn_burden_for_text, n = Inf)
+
+cat("\n--- Binary high-burden summary ---\n")
+print(bar_high_df, n = Inf)
+
+cat("\n--- Binary chi-square test ---\n")
+print(chisq_binary_burden_for_text)
+
+# ==============================================================================
+# 7A. Key arms bubble plot
+#     Arm-level relative CN in chr2q, chr3q, chr9p, chr11q
+# ==============================================================================
+
+# --- Libraries ---
+library(ggplot2)
+library(dplyr)
+library(forcats)
+library(tidyr)
+library(stringr)
+
+key_arms <- c("chr2q","chr3q","chr9p","chr11q")
+
+group_cols <- c(
+  "Normal" = "#4DAF4A",
+  "Benign" = "#377EB8",
+  "IEN/early cancer" = "#E41A1C"
+)
+
+# Diverging fill for log2 CN (blue-white-red)
+fill_low  <- "#2166AC"
+fill_mid  <- "#F7F7F7"
+fill_high <- "#B2182B"
+fill_lim  <- c(-0.2, 0.2)
+
+# --- Prepare data & specimen order (by group, then GW-CNA burden) ---
+
+# Harmonise group labels
+spec_order_df <- gw_burden_df %>%
+  mutate(
+    group = factor(
+      outcome_tri_category,
+      levels = c("normal", "benign_conditions", "IEN_early_cancer"),
+      labels = c("Normal", "Benign", "IEN/early cancer")
+    )
+  ) %>%
+  dplyr::select(specimen_ID, group, genome_wide_CNA_burden) %>%
+  distinct() %>%
+  arrange(group, genome_wide_CNA_burden) %>%
+  mutate(specimen_ID = factor(specimen_ID, levels = unique(specimen_ID)))
+
+# Counts for facet headers
+n_by_group <- spec_order_df %>%
+  distinct(specimen_ID, group) %>%
+  count(group, name = "n")
+
+# Labeller
+lab_fun <- function(vals) {
+  m <- match(vals$group, n_by_group$group)
+  vals$group <- paste0(vals$group)
+  vals
+}
+
+heat_df <- arm_level_annot %>%
+  mutate(
+    group = case_when(
+      as.character(endoscopy_outcome_trichotomize) == "0"   ~ "Normal",
+      as.character(endoscopy_outcome_trichotomize) == "0.5" ~ "Benign",
+      as.character(endoscopy_outcome_trichotomize) == "1"   ~ "IEN/early cancer"
+    )
+  ) %>%
+  filter(chromosomal_arm %in% key_arms) %>%
+  mutate(
+    chromosomal_arm = factor(chromosomal_arm, levels = rev(key_arms)),
+    specimen_ID = factor(specimen_ID, levels = levels(spec_order_df$specimen_ID)),
+    group = factor(group, levels = c("Normal", "Benign", "IEN/early cancer"))
+  ) %>%
+  left_join(
+    spec_order_df,
+    by = c("specimen_ID", "group")
+  )
+
+fig3a_bubbles <- ggplot(
+  heat_df,
+  aes(
+    x = specimen_ID,
+    y = chromosomal_arm,
+    size = pmin(0.35, abs(segmented_CN)),
+    fill = segmented_CN
+  )
+) +
+  geom_point(
+    shape = 21,
+    colour = "grey20",
+    stroke = 0.18,
+    alpha = 0.9
+  ) +
+  facet_grid(. ~ group, scales = "free_x", labeller = lab_fun) +
+  scale_size_continuous(
+    range  = c(1.3, 6.4),
+    breaks = c(0.05, 0.10, 0.20),
+    labels = c("0.05", "0.10", "0.20"),
+    name   = "|log2 CN|"
+  ) +
+  scale_fill_gradient2(
+    low = "#3B74B2",
+    mid = "white",
+    high = "#C33C3C",
+    midpoint = 0,
+    limits = c(-0.2, 0.2),
+    oob = scales::squish,
+    name = "Relative copy number (log2)"
+  ) +
+  labs(
+    title = NULL,
+    x = "Capsule sponge specimens [ordered by GW-CNA burden within group]",
+    y = "Chromosome arm"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    panel.border     = element_blank(),
+    panel.grid       = element_blank(),
+    panel.spacing.x  = unit(0.25, "lines"),
+    axis.ticks.x     = element_blank(),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(face = "bold", size = 9),
+    axis.title.x     = element_text(face = "bold", size = 9, margin = margin(t = 4)),
+    axis.title.y     = element_text(face = "bold", size = 9, margin = margin(r = 4)),
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 10),
+    plot.title       = element_text(face = "bold", size = 11, hjust = 0.5),
+
+    legend.position  = "right",
+    legend.box       = "vertical",
+    legend.box.just  = "left",
+    legend.title.align = 0,
+    legend.spacing.y = unit(2, "mm"),
+    legend.margin    = margin(0, 0, 0, 0),
+    legend.title     = element_text(face = "bold", size = 9),
+    legend.text      = element_text(size = 9)
+  ) +
+  scale_y_discrete(expand = expansion(mult = c(0.10, 0.10))) +
+  scale_x_discrete(expand = expansion(mult = c(0, 0))) +
+  guides(
+    fill = guide_colourbar(
+      order = 1,
+      title.position = "top",
+      title.hjust = 0,
+      label.position = "right",
+      label.hjust = 0,
+      barwidth = unit(2.2, "mm"),
+      barheight = unit(16, "mm"),
+      ticks = FALSE
+    ),
+    size = guide_legend(
+      order = 2,
+      title.position = "top",
+      title.hjust = 0,
+      label.hjust = 0,
+      keywidth = unit(2.2, "mm"),
+      keyheight = unit(2.2, "mm"),
+      override.aes = list(stroke = 0.18, alpha = 0.9)
+    )
+  )
+
+print(fig3a_bubbles)
+
+ggsave(
+  file.path(fig_dir, "Figure_3A.pdf"),
+  fig3a_bubbles,
+  width = 10,
+  height = 3.5,
+  units = "in",
+  dpi = 600,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "Figure_3A.png"),
+  fig3a_bubbles,
+  width = 10,
+  height = 3.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+# ==============================================================================
+# 7B. Key arm alteration frequency
+#     Frequency of altered chr2q, chr3q, chr9p and chr11q across outcome groups
+# ==============================================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+# ------------------------------------------------------------------------------
+# For each specimen and chromosome arm, calculate the proportion of 50 kb bins
+# classified as altered. 
+# ------------------------------------------------------------------------------
+
+key_arms <- c("chr2q", "chr3q", "chr9p", "chr11q")
+
+# STEP 1: Calculate proportion of altered 50 kb bins within each arm/specimen
+arm_level_alteration_density <- sponge_CN_50kb_long_annot %>%
+  group_by(specimen_ID, chromosomal_arm, outcome_tri_category) %>%
+  summarise(
+    altered_segments = sum(is_altered == "altered", na.rm = TRUE),
+    total_segments = n(),
+    alteration_density = altered_segments / total_segments,
+    .groups = "drop"
+  )
+
+# STEP 2: Use the control-derived threshold from the GW-CNA burden analysis
+arm_alteration_threshold <- gw_threshold
+
+print(arm_alteration_threshold)
+
+# STEP 3: Classify each key arm as altered
+arm_alteration_status <- arm_level_alteration_density %>%
+  filter(chromosomal_arm %in% key_arms) %>%
+  mutate(
+    outcome_tri_category = factor(
+      outcome_tri_category,
+      levels = c("normal", "benign_conditions", "IEN_early_cancer")
+    ),
+    is_arm_altered = if_else(
+      alteration_density >= arm_alteration_threshold,
+      1L,
+      0L
+    )
+  )
+
+# STEP 4: Calculate alteration frequency by chromosome arm and outcome group
+arm_alteration_frequency <- arm_alteration_status %>%
+  group_by(chromosomal_arm, outcome_tri_category) %>%
+  summarise(
+    samples_with_alteration = sum(is_arm_altered == 1, na.rm = TRUE),
+    total_samples = n_distinct(specimen_ID),
+    frequency = samples_with_alteration / total_samples * 100,
+    .groups = "drop"
+  )
+
+print(arm_alteration_frequency, n = Inf)
+
+# STEP 5: Chi-square test for alteration status across outcome groups, per arm
+chi_square_results <- arm_alteration_status %>%
+  filter(chromosomal_arm %in% key_arms) %>%
+  group_by(chromosomal_arm) %>%
+  summarise(
+    chisq_test = list(
+      chisq.test(table(is_arm_altered, outcome_tri_category))
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    statistic = map_dbl(chisq_test, ~ unname(.x$statistic)),
+    p_value = map_dbl(chisq_test, ~ .x$p.value)
+  ) %>%
+  dplyr::select(chromosomal_arm, statistic, p_value)
+
+print(chi_square_results, n = Inf)
+
+# STEP 6: Count samples with at least one altered key arm
+sample_summary <- arm_alteration_status %>%
+  group_by(specimen_ID, outcome_tri_category) %>%
+  summarise(
+    has_at_least_one_key_arm_altered = any(is_arm_altered == 1),
+    .groups = "drop"
+  ) %>%
+  group_by(outcome_tri_category) %>%
+  summarise(
+    samples_with_at_least_one_key_arm_altered =
+      sum(has_at_least_one_key_arm_altered),
+    total_samples = n_distinct(specimen_ID),
+    pct_with_at_least_one =
+      samples_with_at_least_one_key_arm_altered / total_samples * 100,
+    .groups = "drop"
+  )
+
+print(sample_summary, n = Inf)
+
+# STEP 7: Key-arm frequency table
+freq_text_table <- arm_alteration_frequency %>%
+  mutate(
+    outcome_label = factor(
+      outcome_tri_category,
+      levels = c("IEN_early_cancer", "benign_conditions", "normal"),
+      labels = c("IEN/early cancer", "Benign", "Normal")
+    ),
+    chromosomal_arm = factor(
+      chromosomal_arm,
+      levels = c("chr3q", "chr9p", "chr2q", "chr11q")
+    ),
+    freq_label = paste0(
+      sprintf("%.1f%%", frequency),
+      " (", samples_with_alteration, "/", total_samples, ")"
+    )
+  ) %>%
+  dplyr::select(
+    chromosomal_arm,
+    outcome_label,
+    freq_label,
+    samples_with_alteration,
+    total_samples,
+    frequency
+  ) %>%
+  arrange(chromosomal_arm, outcome_label)
+
+print(freq_text_table, n = Inf)
+
+freq_text_table_wide <- freq_text_table %>%
+  dplyr::select(chromosomal_arm, outcome_label, freq_label) %>%
+  tidyr::pivot_wider(
+    names_from = outcome_label,
+    values_from = freq_label
+  )
+
+manuscript_key_arm_table <- freq_text_table_wide %>%
+  left_join(
+    chi_square_results %>%
+      mutate(
+        chromosomal_arm = factor(
+          chromosomal_arm,
+          levels = c("chr3q", "chr9p", "chr2q", "chr11q")
+        ),
+        chi_square = round(statistic, 1),
+        p_formatted = formatC(p_value, format = "e", digits = 2)
+      ) %>%
+      dplyr::select(chromosomal_arm, chi_square, p_formatted),
+    by = "chromosomal_arm"
+  ) %>%
+  arrange(chromosomal_arm)
+
+print(manuscript_key_arm_table, n = Inf)
+
+# STEP 8: Harmonise labels and order for plotting
+plot_freq <- arm_alteration_frequency %>%
+  mutate(
+    chromosomal_arm = factor(
+      chromosomal_arm,
+      levels = c("chr3q", "chr9p", "chr2q", "chr11q")
+    ),
+    group_plot = factor(
+      outcome_tri_category,
+      levels = c("normal", "benign_conditions", "IEN_early_cancer"),
+      labels = c("Normal", "Benign", "IEN/early cancer")
+    ),
+    pct_label = paste0(round(frequency, 1), "%")
+  )
+
+cols <- c(
+  "Normal" = "#4DAF4A",
+  "Benign" = "#377EB8",
+  "IEN/early cancer" = "#E41A1C"
+)
+
+# STEP 9: Plot
+p_key_arm_frequency <- ggplot(
+  plot_freq,
+  aes(
+    x = chromosomal_arm,
+    y = frequency,
+    fill = group_plot
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.68),
+    width = 0.6,
+    colour = NA
+  ) +
+  geom_text(
+    aes(label = pct_label),
+    position = position_dodge(width = 0.68),
+    vjust = -0.45,
+    size = 3.8,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = cols,
+    name = "Endoscopic outcome"
+  ) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    expand = expansion(mult = c(0, 0.06))
+  ) +
+  labs(
+    x = "Chromosome arm",
+    y = "Frequency with alteration (%)",
+    title = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_line(colour = "grey88", linewidth = 0.45),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.border       = element_blank(),
+    axis.line          = element_line(colour = "black", linewidth = 0.6),
+    axis.title         = element_text(face = "bold"),
+    axis.text          = element_text(face = "bold"),
+    legend.title       = element_text(face = "bold"),
+    plot.margin        = margin(t = 5, r = 6, b = 10, l = 6)
+  )
+
+print(p_key_arm_frequency)
+
+# STEP 10: Save
+ggsave(
+  file.path(fig_dir, "Figure_3B.pdf"),
+  p_key_arm_frequency,
+  width = 11,
+  height = 6,
+  units = "in",
+  dpi = 600,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "Figure_3B.png"),
+  p_key_arm_frequency,
+  width = 11,
+  height = 6,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+
+# ==============================================================================
+# 8. Genome-wide burden vs key-arm instability (correlation)
+# ==============================================================================
+
+library(dplyr)
+library(ggplot2)
+
+# --- settings ---
+# Expect: key_arms <- c("chr2q","chr3q","chr9p","chr11q")
+
+custom_colors <- c(
+  "Normal"           = "#4DAF4A",
+  "Benign"           = "#377EB8",
+  "IEN/early cancer" = "#E41A1C"
+)
+
+# --- 1) Per-arm instability (sum of |log2 CN| across 50kb bins) ---
+arm_instab <- sponge_CN_50kb_long_annot %>%
+  filter(chromosomal_arm %in% key_arms) %>%
+  mutate(abs_cn = abs(segmented_CN)) %>%
+  group_by(specimen_ID, chromosomal_arm) %>%
+  summarise(
+    arm_instability_score = sum(abs_cn, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- 2) Specimen-level cumulative instability (mean across key arms) ---
+instability_df <- arm_instab %>%
+  group_by(specimen_ID) %>%
+  summarise(
+    mean_arm_instability = mean(arm_instability_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  inner_join(
+    gw_burden_df %>%
+      dplyr::select(
+        specimen_ID,
+        outcome_tri_category,
+        genome_wide_CNA_burden
+      ),
+    by = "specimen_ID"
+  ) %>%
+  mutate(
+    OutcomeGroup = factor(
+      outcome_tri_category,
+      levels = c("normal", "benign_conditions", "IEN_early_cancer"),
+      labels = c("Normal", "Benign", "IEN/early cancer")
+    )
+  )
+
+# --- 3) Correlation (Pearson) ---
+cor_res <- cor.test(
+  instability_df$genome_wide_CNA_burden,
+  instability_df$mean_arm_instability,
+  method = "pearson"
+)
+
+print(cor_res)
+
+r_lab <- if (cor_res$p.value < 0.001) {
+  sprintf(
+    "r = %.2f, P < 0.001",
+    unname(cor_res$estimate)
+  )
+} else {
+  sprintf(
+    "r = %.2f, P = %.3g",
+    unname(cor_res$estimate),
+    cor_res$p.value
+  )
+}
+# --- 4) Plot ---
+x_rng <- range(instability_df$genome_wide_CNA_burden, na.rm = TRUE)
+y_rng <- range(instability_df$mean_arm_instability, na.rm = TRUE)
+
+x_range <- range(instability_df$genome_wide_CNA_burden, na.rm = TRUE)
+y_range <- range(instability_df$mean_arm_instability, na.rm = TRUE)
+
+p_corr <- ggplot(
+  instability_df,
+  aes(
+    x = genome_wide_CNA_burden,
+    y = mean_arm_instability,
+    color = OutcomeGroup
+  )
+) +
+  geom_point(size = 4, shape = 21, fill = "white", stroke = 1) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    color = "black",
+    linetype = "solid",
+    size = 0.8
+  ) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    x = "Genome-wide CNA burden",
+    y = "Cumulative instability in key arms",
+    title = NULL,
+    color = NULL
+  ) +
+  annotate(
+    "text",
+    x = max(x_rng) * 0.02,
+    y = max(y_rng) * 0.98,
+    hjust = 0,
+    vjust = 1,
+    label = r_lab,
+    fontface = "italic",
+    size = 4
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.35),
+    panel.grid.major.y = element_line(colour = "grey88", linewidth = 0.45),
+    panel.grid.minor   = element_blank(),
+    panel.border       = element_blank(),
+    axis.line          = element_line(colour = "black", linewidth = 0.6),
+    axis.title         = element_text(face = "bold"),
+    axis.text          = element_text(face = "bold"),
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    legend.position    = "top"
+  ) +
+  scale_y_continuous(
+    limits = c(0, max(y_range) * 1.1),
+    expand = expansion(mult = c(0.05, 0.05))
+  ) +
+  scale_x_continuous(
+    limits = c(0, max(x_range) * 1.1),
+    expand = expansion(mult = c(0.05, 0.05))
+  )
+
+print(p_corr)
+
+# --- 5) Export ---
+ggsave(
+  file.path(fig_dir, "Figure_3C.pdf"),
+  p_corr,
+  width = 6.8,
+  height = 4.6,
+  units = "in",
+  dpi = 600,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "Figure_3C.png"),
+  p_corr,
+  width = 6.8,
+  height = 4.6,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+# ==============================================================================
+# 9. Diagnostic modelling with cross-validation
+#    Binomial logistic regression models evaluated using repeated stratified
+#    5-fold cross-validation
+# ==============================================================================
+
+library(caret)
+library(pROC)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ------------------------------------------------------------------------------
+# 1. Prepare modelling dataframe
+# ------------------------------------------------------------------------------
+
+model_df <- arm_level_annot %>%
+  dplyr::select(
+    sequencing_ID,
+    specimen_ID,
+    case_ID,
+    chromosomal_arm,
+    segmented_CN,
+    endoscopy_outcome_binarized,
+    endoscopy_outcome_trichotomize,
+    genome_wide_CNA_burden,
+    genome_wide_CNA_burden_binary,
+    age,
+    sex,
+    bmi,
+    chest_rth,
+    smoking_binary,
+    cytosponge_definite_sq_atypia,
+    p53_staining_binarized
+  ) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = chromosomal_arm,
+    values_from = segmented_CN
+  ) %>%
+  mutate(
+    endoscopy_outcome_binarized = factor(
+      endoscopy_outcome_binarized,
+      levels = c(0, 1),
+      labels = c("X0", "X1")
+    ),
+    sex = factor(sex),
+    chest_rth = factor(chest_rth),
+    cytosponge_definite_sq_atypia = factor(cytosponge_definite_sq_atypia),
+    p53_staining_binarized = factor(p53_staining_binarized),
+    genome_wide_CNA_burden_binary = factor(genome_wide_CNA_burden_binary),
+    bmi = as.numeric(bmi)
+  )
+
+# Check missingness in candidate covariates
+colMeans(is.na(model_df[, c(
+  "age",
+  "sex",
+  "bmi",
+  "chest_rth",
+  "cytosponge_definite_sq_atypia",
+  "p53_staining_binarized",
+  "genome_wide_CNA_burden",
+  "genome_wide_CNA_burden_binary",
+  "chr2q",
+  "chr3q",
+  "chr9p",
+  "chr11q"
+)]))
+
+# ------------------------------------------------------------------------------
+# 2. Define outcome and predictor sets
+# ------------------------------------------------------------------------------
+
+target <- "endoscopy_outcome_binarized"
+
+copy_number_continuous <- c(
+  "chr9p",
+  "chr2q",
+  "chr3q",
+  "chr11q",
+  "genome_wide_CNA_burden"
+)
+
+copy_number_binary <- c(
+  "chr9p",
+  "chr2q",
+  "chr3q",
+  "chr11q",
+  "genome_wide_CNA_burden_binary"
+)
+
+pathology_vars <- c(
+  "cytosponge_definite_sq_atypia",
+  "p53_staining_binarized"
+)
+
+all_model_vars <- unique(c(
+  target,
+  copy_number_continuous,
+  copy_number_binary,
+  pathology_vars
+))
+
+# Use a common complete-case analysis set for fair comparison across models
+model_df_cc <- model_df %>%
+  dplyr::select(all_of(all_model_vars)) %>%
+  tidyr::drop_na()
+
+table(model_df_cc[[target]])
+
+# ------------------------------------------------------------------------------
+# 3. Cross-validation setup
+# ------------------------------------------------------------------------------
+
+extendedSummary <- function(data, lev = NULL, model = NULL) {
+  
+  roc_obj <- pROC::roc(
+    response = data$obs,
+    predictor = data[, lev[2]],
+    levels = rev(lev),
+    quiet = TRUE
+  )
+  
+  youden <- pROC::coords(
+    roc_obj,
+    x = "best",
+    best.method = "youden",
+    ret = c("threshold", "sensitivity", "specificity"),
+    transpose = FALSE
+  )
+  
+  threshold <- as.numeric(youden$threshold)
+  
+  predicted <- ifelse(
+    data[, lev[2]] > threshold,
+    lev[2],
+    lev[1]
+  )
+  
+  cm <- caret::confusionMatrix(
+    factor(predicted, levels = lev),
+    factor(data$obs, levels = lev),
+    positive = lev[2]
+  )
+  
+  ppv <- as.numeric(cm$byClass["Pos Pred Value"])
+  npv <- as.numeric(cm$byClass["Neg Pred Value"])
+  sens <- as.numeric(youden$sensitivity)
+  spec <- as.numeric(youden$specificity)
+  
+  f1 <- ifelse(
+    is.na(ppv) | is.na(sens) | (ppv + sens) == 0,
+    NA_real_,
+    2 * (ppv * sens) / (ppv + sens)
+  )
+  
+  c(
+    ROC = as.numeric(roc_obj$auc),
+    Sens = sens,
+    Spec = spec,
+    YoudenIndex = threshold,
+    PPV = ppv,
+    NPV = npv,
+    F1 = f1
+  )
+}
+
+set.seed(567)
+
+fold_index <- caret::createMultiFolds(
+  y = model_df_cc[[target]],
+  k = 5,
+  times = 10
+)
+
+cv_control <- caret::trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 10,
+  index = fold_index,
+  classProbs = TRUE,
+  summaryFunction = extendedSummary,
+  savePredictions = "final"
+)
+
+cv_ctrl <- trainControl(
+  method          = "repeatedcv",
+  number          = 5,
+  repeats         = 10,
+  classProbs      = TRUE,
+  summaryFunction = extendedSummary,
+  savePredictions = "final",
+  allowParallel   = TRUE
+)
+# ------------------------------------------------------------------------------
+# 4. Train models
+# ------------------------------------------------------------------------------
+
+set.seed(567)
+
+model_list <- list(
+  "Genomic (Continuous)" = caret::train(
+    reformulate(copy_number_continuous, response = target),
+    data = model_df_cc,
+    method = "glm",
+    family = binomial,
+    trControl = cv_control,
+    metric = "ROC"
+  ),
+  
+  "Genomic (Binary)" = caret::train(
+    reformulate(copy_number_binary, response = target),
+    data = model_df_cc,
+    method = "glm",
+    family = binomial,
+    trControl = cv_control,
+    metric = "ROC"
+  ),
+  
+  "Pathology" = caret::train(
+    reformulate(pathology_vars, response = target),
+    data = model_df_cc,
+    method = "glm",
+    family = binomial,
+    trControl = cv_control,
+    metric = "ROC"
+  )
+)
+
+# ------------------------------------------------------------------------------
+# 5. Extract cross-validation metrics
+# ------------------------------------------------------------------------------
+
+calculate_ci <- function(values, conf_level = 0.95) {
+  values <- values[!is.na(values)]
+  n <- length(values)
+  mean_value <- mean(values)
+  error <- qt((1 + conf_level) / 2, df = n - 1) * sd(values) / sqrt(n)
+  
+  c(
+    mean = mean_value,
+    lower = mean_value - error,
+    upper = mean_value + error
+  )
+}
+
+extract_metrics <- function(model) {
+  
+  resamples <- model$resample
+  
+  accuracy_values <- tapply(
+    model$pred$pred == model$pred$obs,
+    model$pred$Resample,
+    mean
+  )
+  
+  list(
+    Sensitivity = calculate_ci(resamples$Sens),
+    Specificity = calculate_ci(resamples$Spec),
+    PPV = calculate_ci(resamples$PPV),
+    NPV = calculate_ci(resamples$NPV),
+    F1 = calculate_ci(resamples$F1),
+    Accuracy = calculate_ci(accuracy_values)
+  )
+}
+
+print_results <- function(model_name, metrics) {
+  cat("\n", model_name, " Model Results:\n", sep = "")
+  cat(sprintf(
+    "Sensitivity: %.3f (95%% CI %.3f–%.3f)\n",
+    metrics$Sensitivity["mean"],
+    metrics$Sensitivity["lower"],
+    metrics$Sensitivity["upper"]
+  ))
+  cat(sprintf(
+    "Specificity: %.3f (95%% CI %.3f–%.3f)\n",
+    metrics$Specificity["mean"],
+    metrics$Specificity["lower"],
+    metrics$Specificity["upper"]
+  ))
+  cat(sprintf(
+    "PPV: %.3f (95%% CI %.3f–%.3f)\n",
+    metrics$PPV["mean"],
+    metrics$PPV["lower"],
+    metrics$PPV["upper"]
+  ))
+  cat(sprintf(
+    "NPV: %.3f (95%% CI %.3f–%.3f)\n",
+    metrics$NPV["mean"],
+    metrics$NPV["lower"],
+    metrics$NPV["upper"]
+  ))
+  cat(sprintf(
+    "F1 Score: %.3f (95%% CI %.3f–%.3f)\n",
+    metrics$F1["mean"],
+    metrics$F1["lower"],
+    metrics$F1["upper"]
+  ))
+  cat(sprintf(
+    "Accuracy: %.3f (95%% CI %.3f–%.3f)\n",
+    metrics$Accuracy["mean"],
+    metrics$Accuracy["lower"],
+    metrics$Accuracy["upper"]
+  ))
+}
+
+performance_metrics <- lapply(model_list, extract_metrics)
+
+for (model_name in names(performance_metrics)) {
+  print_results(model_name, performance_metrics[[model_name]])
+}
+
+
+# Helper: ROC/AUC from pooled out-of-fold predictions
+roc_from_caret <- function(mod, pos_class_col = "X1") {
+  
+  preds <- mod$pred
+  
+  if (!is.null(mod$bestTune)) {
+    for (param in names(mod$bestTune)) {
+      preds <- preds[preds[[param]] == mod$bestTune[[param]], ]
+    }
+  }
+  
+  preds$obs <- factor(preds$obs, levels = c("X0", "X1"))
+  
+  roc_obj <- pROC::roc(
+    response = preds$obs,
+    predictor = preds[[pos_class_col]],
+    levels = c("X0", "X1"),
+    direction = "<",
+    ci = TRUE,
+    quiet = TRUE
+  )
+  
+  list(
+    roc = roc_obj,
+    auc = as.numeric(pROC::auc(roc_obj)),
+    ci = as.numeric(pROC::ci.auc(roc_obj, method = "delong"))
+  )
+}
+
+main_auc_tbl <- purrr::imap_dfr(model_list, function(mod, nm) {
+  roc_info <- roc_from_caret(mod)
+  tibble::tibble(
+    Model = nm,
+    AUC = roc_info$auc,
+    AUC_lower = roc_info$ci[1],
+    AUC_upper = roc_info$ci[3]
+  )
+})
+
+print(main_auc_tbl)
+# ------------------------------------------------------------------------------
+# 6. ROC curves from pooled out-of-fold predictions
+# ------------------------------------------------------------------------------
+
+# roc_from_caret() was defined above before first use.
+rocs <- list(
+  "Genomic (cont. GWS + arms)" = roc_from_caret(
+    model_list[["Genomic (Continuous)"]]
+  ),
+  "Genomic (binary GWS + arms)" = roc_from_caret(
+    model_list[["Genomic (Binary)"]]
+  ),
+  "Pathology (atypia + p53)" = roc_from_caret(
+    model_list[["Pathology"]]
+  )
+)
+
+roc_objs <- lapply(rocs, `[[`, "roc")
+
+# ------------------------------------------------------------------------------
+# 7. Plot ROC curves
+# ------------------------------------------------------------------------------
+
+palette_roc <- c(
+  "Genomic (cont. GWS + arms)" = "#E69F00",
+  "Genomic (binary GWS + arms)" = "#CC79A7",
+  "Pathology (atypia + p53)" = "#4D4D4D"
+)
+
+legend_labels <- sapply(names(rocs), function(nm) {
+  auc <- rocs[[nm]]$auc
+  ciL <- rocs[[nm]]$ci[1]
+  ciU <- rocs[[nm]]$ci[3]
+  sprintf(
+    "%s   AUC %.3f (95%% CI %.3f to %.3f)",
+    nm,
+    auc,
+    ciL,
+    ciU
+  )
+})
+
+p_roc <- pROC::ggroc(
+  roc_objs,
+  legacy.axes = TRUE,
+  size = 1.4
+) +
+  scale_color_manual(
+    values = palette_roc,
+    breaks = names(rocs),
+    labels = legend_labels,
+    name = NULL
+  ) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    colour = "grey65",
+    linewidth = 0.7
+  ) +
+  coord_equal(
+    xlim = c(0, 1),
+    ylim = c(0, 1),
+    expand = FALSE
+  ) +
+  scale_x_continuous(breaks = seq(0, 1, 0.25)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25)) +
+  labs(
+    x = "False positive rate",
+    y = "True positive rate"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.major = element_line(colour = "grey88", linewidth = 0.45),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.text = element_text(size = 11, margin = margin(b = 2)),
+    legend.key.width = unit(18, "pt"),
+    legend.key.height = unit(12, "pt"),
+    plot.margin = margin(8, 8, 8, 8)
+  ) +
+  guides(
+    colour = guide_legend(
+      byrow = TRUE,
+      ncol = 1,
+      override.aes = list(size = 1.6, alpha = 1)
+    )
+  )
+
+print(p_roc)
+
+# ------------------------------------------------------------------------------
+# 8. Save ROC figure
+# ------------------------------------------------------------------------------
+
+ggsave(
+  file.path(fig_dir, "Figure_4.pdf"),
+  p_roc,
+  width = 6.4,
+  height = 6.4,
+  units = "in",
+  dpi = 600,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "Figure_4.png"),
+  p_roc,
+  width = 6.4,
+  height = 6.4,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+# ==============================================================================
+# 9B. Supplementary Table 2
+#     Comparative performance of genomic models with and without arm-level features
+# ==============================================================================
+
+library(dplyr)
+library(tibble)
+library(purrr)
+library(readr)
+
+# ------------------------------------------------------------------------------
+# 1. Define predictor sets for Supplementary Table 2
+# ------------------------------------------------------------------------------
+
+pred_burden_only_cont <- c(
+  "genome_wide_CNA_burden"
+)
+
+pred_arms_only <- c(
+  "chr2q",
+  "chr3q",
+  "chr9p",
+  "chr11q"
+)
+
+pred_genomic_cont <- c(
+  "chr2q",
+  "chr3q",
+  "chr11q",
+  "chr9p",
+  "genome_wide_CNA_burden"
+)
+
+# ------------------------------------------------------------------------------
+# 2. Train models using the same cross-validation setup
+# ------------------------------------------------------------------------------
+
+set.seed(567)
+
+supp2_model_list <- list(
+  "Burden only (continuous)" = caret::train(
+    reformulate(pred_burden_only_cont, response = target),
+    data = model_df_cc,
+    method = "glm",
+    family = binomial,
+    trControl = cv_control,
+    metric = "ROC"
+  ),
+  
+  "Arms only" = caret::train(
+    reformulate(pred_arms_only, response = target),
+    data = model_df_cc,
+    method = "glm",
+    family = binomial,
+    trControl = cv_control,
+    metric = "ROC"
+  ),
+  
+  "Genomic (continuous)" = caret::train(
+    reformulate(pred_genomic_cont, response = target),
+    data = model_df_cc,
+    method = "glm",
+    family = binomial,
+    trControl = cv_control,
+    metric = "ROC"
+  )
+)
+
+# ------------------------------------------------------------------------------
+# 3. Compare AUC improvement: combined genomic model versus burden-only model
+# ------------------------------------------------------------------------------
+
+roc_compare <- supp2_model_list[["Burden only (continuous)"]]$resample %>%
+  dplyr::select(
+    Resample,
+    ROC_burden = ROC
+  ) %>%
+  left_join(
+    supp2_model_list[["Genomic (continuous)"]]$resample %>%
+      dplyr::select(
+        Resample,
+        ROC_full = ROC
+      ),
+    by = "Resample"
+  ) %>%
+  mutate(
+    delta_ROC = ROC_full - ROC_burden
+  )
+
+print(summary(roc_compare$delta_ROC))
+
+delta_auc_test <- t.test(roc_compare$delta_ROC)
+
+print(delta_auc_test)
+
+delta_auc_summary <- tibble(
+  comparison = "Genomic (continuous) minus burden only",
+  mean_delta_AUC = unname(delta_auc_test$estimate),
+  lower_95_CI = delta_auc_test$conf.int[1],
+  upper_95_CI = delta_auc_test$conf.int[2],
+  p_value = delta_auc_test$p.value
+)
+
+print(delta_auc_summary)
+
+# ------------------------------------------------------------------------------
+# 4. AUC with DeLong CI from pooled out-of-fold predictions
+# ------------------------------------------------------------------------------
+
+supp2_auc_tbl <- imap_dfr(supp2_model_list, function(mod, nm) {
+  
+  roc_info <- roc_from_caret(mod)
+  
+  tibble(
+    Model = nm,
+    AUC = roc_info$auc,
+    AUC_lower = roc_info$ci[1],
+    AUC_upper = roc_info$ci[3]
+  )
+})
+
+print(supp2_auc_tbl)
+
+# ------------------------------------------------------------------------------
+# 5. Cross-validation metrics
+# ------------------------------------------------------------------------------
+
+supp2_metric_tbl <- imap_dfr(supp2_model_list, function(mod, nm) {
+  
+  met <- extract_metrics(mod)
+  
+  tibble(
+    Model = nm,
+    
+    Sensitivity = unname(met$Sensitivity["mean"]),
+    Sensitivity_lower = unname(met$Sensitivity["lower"]),
+    Sensitivity_upper = unname(met$Sensitivity["upper"]),
+    
+    Specificity = unname(met$Specificity["mean"]),
+    Specificity_lower = unname(met$Specificity["lower"]),
+    Specificity_upper = unname(met$Specificity["upper"]),
+    
+    Accuracy = unname(met$Accuracy["mean"]),
+    Accuracy_lower = unname(met$Accuracy["lower"]),
+    Accuracy_upper = unname(met$Accuracy["upper"]),
+    
+    PPV = unname(met$PPV["mean"]),
+    PPV_lower = unname(met$PPV["lower"]),
+    PPV_upper = unname(met$PPV["upper"]),
+    
+    NPV = unname(met$NPV["mean"]),
+    NPV_lower = unname(met$NPV["lower"]),
+    NPV_upper = unname(met$NPV["upper"]),
+    
+    F1 = unname(met$F1["mean"]),
+    F1_lower = unname(met$F1["lower"]),
+    F1_upper = unname(met$F1["upper"])
+  )
+})
+
+print(supp2_metric_tbl)
+
+# ------------------------------------------------------------------------------
+# 6. Combine and format Supplementary Table 2
+# ------------------------------------------------------------------------------
+
+supp2_model_tbl <- supp2_auc_tbl %>%
+  left_join(
+    supp2_metric_tbl,
+    by = "Model"
+  )
+
+fmt_ci <- function(mean, lower, upper, digits = 3) {
+  sprintf(
+    paste0("%.", digits, "f (95%% CI %.", digits, "f–%.", digits, "f)"),
+    mean,
+    lower,
+    upper
+  )
+}
+
+supp2_model_tbl_fmt <- supp2_model_tbl %>%
+  transmute(
+    Model,
+    `AUC (95% CI)` = fmt_ci(AUC, AUC_lower, AUC_upper),
+    `Sensitivity (95% CI)` = fmt_ci(Sensitivity, Sensitivity_lower, Sensitivity_upper),
+    `Specificity (95% CI)` = fmt_ci(Specificity, Specificity_lower, Specificity_upper),
+    `Accuracy (95% CI)` = fmt_ci(Accuracy, Accuracy_lower, Accuracy_upper),
+    `PPV (95% CI)` = fmt_ci(PPV, PPV_lower, PPV_upper),
+    `NPV (95% CI)` = fmt_ci(NPV, NPV_lower, NPV_upper),
+    `F1 (95% CI)` = fmt_ci(F1, F1_lower, F1_upper)
+  )
+
+print(supp2_model_tbl_fmt, n = Inf, width = Inf)
+
+
+
+# ------------------------------------------------------------------------------
+# 7. Save Supplementary Table 2
+# ------------------------------------------------------------------------------
+
+readr::write_tsv(
+  supp2_model_tbl_fmt,
+  file.path(tables_dir, "Supplementary_Table_2_model_performance.tsv")
+)
+
+readr::write_csv(
+  supp2_model_tbl_fmt,
+  file.path(tables_dir, "Supplementary_Table_2_model_performance.csv")
+)
+
+readr::write_tsv(
+  delta_auc_summary,
+  file.path(tables_dir, "Supplementary_Table_2_delta_AUC_summary.tsv")
+)
+
+readr::write_csv(
+  delta_auc_summary,
+  file.path(tables_dir, "Supplementary_Table_2_delta_AUC_summary.csv")
+)
+
+# ==============================================================================
+# 10. Post hoc patient-level aggregation of out-of-fold predictions
+# ==============================================================================
+
+library(dplyr)
+library(pROC)
+library(caret)
+library(readr)
+library(tibble)
+
+# ------------------------------------------------------------------------------
+# 10.1 Create lookup table linking caret rowIndex to specimen and patient IDs
+#      This must match the exact rows used for model training.
+# ------------------------------------------------------------------------------
+
+model_lookup_base <- model_df %>%
+  mutate(original_row = row_number()) %>%
+  dplyr::select(
+    original_row,
+    sequencing_ID,
+    specimen_ID,
+    case_ID,
+    all_of(all_model_vars)
+  ) %>%
+  tidyr::drop_na(all_of(all_model_vars))
+
+id_lookup_row <- model_lookup_base %>%
+  mutate(rowIndex = row_number()) %>%
+  dplyr::select(
+    rowIndex,
+    sequencing_ID,
+    specimen_ID,
+    case_ID,
+    endoscopy_outcome_binarized
+  )
+
+# Sanity checks: lookup rows should match modelling rows
+stopifnot(nrow(id_lookup_row) == nrow(model_df_cc))
+stopifnot(all(id_lookup_row$endoscopy_outcome_binarized == model_df_cc[[target]]))
+
+table(id_lookup_row$endoscopy_outcome_binarized)
+
+# ------------------------------------------------------------------------------
+# 10.2 Function to aggregate out-of-fold scroll-set predictions to patient level
+# ------------------------------------------------------------------------------
+
+get_patient_level_preds <- function(mod, id_lookup, pos_class = "X1") {
+  
+  preds <- mod$pred
+  
+  # Keep only best tuning parameters if relevant
+  if (!is.null(mod$bestTune) && nrow(mod$bestTune) > 0) {
+    for (p in names(mod$bestTune)) {
+      preds <- preds[preds[[p]] == mod$bestTune[[p]], , drop = FALSE]
+    }
+  }
+  
+  # Attach specimen and patient identifiers
+  preds <- preds %>%
+    left_join(
+      id_lookup,
+      by = "rowIndex"
+    )
+  
+  # Check that all predictions mapped correctly
+  if (any(is.na(preds$case_ID))) {
+    stop("Some out-of-fold predictions did not map to case_ID. Check rowIndex alignment.")
+  }
+  
+  # Aggregate scroll-set predictions to patient level within each resample.
+  patient_preds <- preds %>%
+    group_by(Resample, case_ID) %>%
+    summarise(
+      obs = first(endoscopy_outcome_binarized),
+      n_scrollsets_in_resample = n(),
+      patient_prob = max(.data[[pos_class]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  patient_preds
+}
+
+# ------------------------------------------------------------------------------
+# 10.3 Apply aggregation to the continuous genomic model
+# ------------------------------------------------------------------------------
+
+patient_preds_cont <- get_patient_level_preds(
+  mod = model_list[["Genomic (Continuous)"]],
+  id_lookup = id_lookup_row,
+  pos_class = "X1"
+)
+
+# ------------------------------------------------------------------------------
+# 10.4 Collapse repeated resample-level patient predictions to one probability
+#      per patient for final ROC analysis
+# ------------------------------------------------------------------------------
+
+patient_preds_cont_final <- patient_preds_cont %>%
+  group_by(case_ID) %>%
+  summarise(
+    obs = first(obs),
+    patient_prob = mean(patient_prob, na.rm = TRUE),
+    n_resamples = n(),
+    .groups = "drop"
+  )
+
+table(patient_preds_cont_final$obs)
+
+# ------------------------------------------------------------------------------
+# 10.5 ROC analysis at patient level
+# ------------------------------------------------------------------------------
+
+roc_patient_cont <- pROC::roc(
+  response = patient_preds_cont_final$obs,
+  predictor = patient_preds_cont_final$patient_prob,
+  levels = c("X0", "X1"),
+  direction = "<",
+  ci = TRUE,
+  quiet = TRUE
+)
+
+patient_auc <- as.numeric(pROC::auc(roc_patient_cont))
+patient_auc_ci <- as.numeric(pROC::ci.auc(roc_patient_cont, method = "delong"))
+
+print(patient_auc)
+print(patient_auc_ci)
+
+# ------------------------------------------------------------------------------
+# 10.6 Derive optimal threshold using Youden's J
+# ------------------------------------------------------------------------------
+
+youden_patient_cont <- pROC::coords(
+  roc_patient_cont,
+  x = "best",
+  best.method = "youden",
+  ret = c("threshold", "sensitivity", "specificity"),
+  transpose = FALSE
+)
+
+thr_patient_cont <- as.numeric(youden_patient_cont$threshold[1])
+
+print(youden_patient_cont)
+print(thr_patient_cont)
+
+# ------------------------------------------------------------------------------
+# 10.7 Classify patient-level predictions and calculate performance metrics
+# ------------------------------------------------------------------------------
+
+patient_preds_cont_final <- patient_preds_cont_final %>%
+  mutate(
+    pred_class = ifelse(patient_prob > thr_patient_cont, "X1", "X0"),
+    pred_class = factor(pred_class, levels = c("X0", "X1")),
+    obs = factor(obs, levels = c("X0", "X1"))
+  )
+
+cm_patient_cont <- caret::confusionMatrix(
+  data = patient_preds_cont_final$pred_class,
+  reference = patient_preds_cont_final$obs,
+  positive = "X1"
+)
+
+print(cm_patient_cont)
+
+patient_level_summary <- tibble(
+  Model = "Genomic continuous, patient-level aggregation",
+  AUC = patient_auc,
+  AUC_lower = patient_auc_ci[1],
+  AUC_upper = patient_auc_ci[3],
+  Threshold = thr_patient_cont,
+  Accuracy = unname(cm_patient_cont$overall["Accuracy"]),
+  Sensitivity = unname(cm_patient_cont$byClass["Sensitivity"]),
+  Specificity = unname(cm_patient_cont$byClass["Specificity"]),
+  PPV = unname(cm_patient_cont$byClass["Pos Pred Value"]),
+  NPV = unname(cm_patient_cont$byClass["Neg Pred Value"])
+)
+
+print(patient_level_summary, n = Inf, width = Inf)
+
+# ------------------------------------------------------------------------------
+# 10.8 Save patient-level predictions and summary
+# ------------------------------------------------------------------------------
+
+readr::write_tsv(
+  patient_preds_cont_final,
+  file.path(tables_dir, "patient_level_predictions_continuous_model.tsv")
+)
+
+readr::write_tsv(
+  patient_level_summary,
+  file.path(tables_dir, "patient_level_summary_continuous_model.tsv")
+)
+
+
+# ==============================================================================
+# 11. Logistic regression coefficients and standardised odds ratios
+#     Extended Data Tables 2A–B and Supplementary Table 4
+# ==============================================================================
+
+library(dplyr)
+library(tibble)
+library(broom)
+library(readr)
+
+# ------------------------------------------------------------------------------
+# 11.1 Prepare coefficient modelling dataframe
+#      This uses the same complete-case dataset as the cross-validation models.
+# ------------------------------------------------------------------------------
+
+coef_model_df <- model_df_cc %>%
+  mutate(
+    genome_wide_CNA_burden_binary = factor(
+      as.character(genome_wide_CNA_burden_binary),
+      levels = c("Low burden", "High burden")
+    )
+  )
+
+# Check reference level
+levels(coef_model_df$genome_wide_CNA_burden_binary)
+
+# ------------------------------------------------------------------------------
+# 11.2 Define model formulas
+# ------------------------------------------------------------------------------
+
+target <- "endoscopy_outcome_binarized"
+
+pred_genomic_cont <- c(
+  "chr9p",
+  "chr2q",
+  "chr3q",
+  "chr11q",
+  "genome_wide_CNA_burden"
+)
+
+pred_genomic_bin <- c(
+  "chr9p",
+  "chr2q",
+  "chr3q",
+  "chr11q",
+  "genome_wide_CNA_burden_binary"
+)
+
+# ------------------------------------------------------------------------------
+# 11.3 Fit final GLMs for coefficient reporting
+# ------------------------------------------------------------------------------
+
+mod_cont <- glm(
+  reformulate(pred_genomic_cont, response = target),
+  data = coef_model_df,
+  family = binomial
+)
+
+mod_bin <- glm(
+  reformulate(pred_genomic_bin, response = target),
+  data = coef_model_df,
+  family = binomial
+)
+
+summary(mod_cont)
+summary(mod_bin)
+
+# ------------------------------------------------------------------------------
+# 11.4 Helper functions for coefficient tables
+# ------------------------------------------------------------------------------
+
+format_p_value <- function(p) {
+  ifelse(
+    p < 0.0001,
+    "<0.0001",
+    formatC(p, format = "f", digits = 4)
+  )
+}
+
+interpret_coef <- function(beta, p) {
+  dplyr::case_when(
+    p < 0.05 & beta > 0   ~ "Positive association",
+    p < 0.05 & beta < 0   ~ "Negative association",
+    p >= 0.05 & p < 0.1 & beta > 0 ~ "Trend towards positive",
+    p >= 0.05 & p < 0.1 & beta < 0 ~ "Trend towards negative",
+    TRUE                  ~ "No clear association"
+  )
+}
+
+recode_predictor_names <- function(x) {
+  dplyr::recode(
+    x,
+    "(Intercept)" = "Intercept",
+    "genome_wide_CNA_burden" = "GW-CNA burden (continuous)",
+    "genome_wide_CNA_burden_binaryHigh burden" = "GW-CNA burden (High versus Low)",
+    "chr2q" = "Chromosomal arm 2q",
+    "chr3q" = "Chromosomal arm 3q",
+    "chr9p" = "Chromosomal arm 9p",
+    "chr11q" = "Chromosomal arm 11q",
+    .default = x
+  )
+}
+
+format_coef_table <- function(mod, desired_order) {
+  
+  summary(mod)$coefficients %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Predictor_raw") %>%
+    dplyr::rename(
+      Coefficient = Estimate,
+      Std_Error = `Std. Error`,
+      p_value = `Pr(>|z|)`
+    ) %>%
+    mutate(
+      Predictor = recode_predictor_names(Predictor_raw),
+      Interpretation = if_else(
+        Predictor == "Intercept",
+        "Baseline risk",
+        interpret_coef(Coefficient, p_value)
+      ),
+      Coefficient_beta = round(Coefficient, 2),
+      Std_Error_formatted = round(Std_Error, 2),
+      p_value_formatted = format_p_value(p_value),
+      Predictor = factor(Predictor, levels = desired_order)
+    ) %>%
+    arrange(Predictor) %>%
+    dplyr::select(
+      Predictor,
+      Coefficient_beta,
+      Std_Error_formatted,
+      p_value_formatted,
+      Interpretation
+    )
+}
+# ------------------------------------------------------------------------------
+# 11.5 Extended Data Table 2A: continuous GW-CNA burden model
+# ------------------------------------------------------------------------------
+
+order_cont <- c(
+  "Intercept",
+  "GW-CNA burden (continuous)",
+  "Chromosomal arm 2q",
+  "Chromosomal arm 3q",
+  "Chromosomal arm 9p",
+  "Chromosomal arm 11q"
+)
+
+extended_data_table_2A <- format_coef_table(
+  mod = mod_cont,
+  desired_order = order_cont
+) %>%
+  dplyr::rename(
+    `Coefficient beta` = Coefficient_beta,
+    `Std. error` = Std_Error_formatted,
+    `P value` = p_value_formatted
+  )
+
+print(extended_data_table_2A)
+
+# ------------------------------------------------------------------------------
+# 11.6 Extended Data Table 2B: binary GW-CNA burden model
+# ------------------------------------------------------------------------------
+
+order_bin <- c(
+  "Intercept",
+  "GW-CNA burden (High versus Low)",
+  "Chromosomal arm 2q",
+  "Chromosomal arm 3q",
+  "Chromosomal arm 9p",
+  "Chromosomal arm 11q"
+)
+
+extended_data_table_2B <- format_coef_table(
+  mod = mod_bin,
+  desired_order = order_bin
+)
+
+print(extended_data_table_2B)
+
+# ------------------------------------------------------------------------------
+# 11.8 Save tables
+# ------------------------------------------------------------------------------
+
+readr::write_tsv(
+  extended_data_table_2A,
+  file.path(tables_dir, "Extended_Data_Table_2A_continuous_genomic_coefficients.tsv")
+)
+
+readr::write_csv(
+  extended_data_table_2A,
+  file.path(tables_dir, "Extended_Data_Table_2A_continuous_genomic_coefficients.csv")
+)
+
+readr::write_tsv(
+  extended_data_table_2B,
+  file.path(tables_dir, "Extended_Data_Table_2B_binary_genomic_coefficients.tsv")
+)
+
+readr::write_csv(
+  extended_data_table_2B,
+  file.path(tables_dir, "Extended_Data_Table_2B_binary_genomic_coefficients.csv")
+)
+
+
+# ==============================================================================
+# 12. Genome-wide 50 kb bin-level copy-number dispersion by diagnostic group
+# ==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(tibble)
+library(readr)
+library(rstatix)
+
+# ------------------------------------------------------------------------------
+# 12.1 Diagnostic group labels
+# ------------------------------------------------------------------------------
+
+diagnostic_levels <- c(
+  "normal",
+  "benign_conditions",
+  "IEN_early_cancer"
+)
+
+diagnostic_labels <- c(
+  "Normal",
+  "Benign",
+  "IEN/early cancer"
+)
+
+standardise_outcome_tri <- function(x) {
+  dplyr::case_when(
+    as.character(x) %in% c("normal", "Normal") ~ "Normal",
+    as.character(x) %in% c("benign_conditions", "Benign") ~ "Benign",
+    as.character(x) %in% c("IEN_early_cancer", "IEN/early cancer") ~ "IEN/early cancer",
+    TRUE ~ NA_character_
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 12.2 Build annotated 50 kb copy-number dataframe if not already available
+# ------------------------------------------------------------------------------
+
+if (!exists("sponge_CN_50kb_long_annot")) {
+  
+  sponge_CN_50kb_long_annot <- sponge_CN_50kb_long %>%
+    inner_join(
+      clinical_df,
+      by = "sequencing_ID"
+    ) %>%
+    inner_join(
+      gw_burden_df %>%
+        dplyr::select(
+          specimen_ID,
+          genome_wide_CNA_burden,
+          genome_wide_CNA_burden_binary,
+          outcome_tri_category
+        ),
+      by = "specimen_ID"
+    )
+}
+
+sponge_CN_50kb_long_annot <- sponge_CN_50kb_long_annot %>%
+  mutate(
+    chromosome_num = as.integer(gsub("^chr", "", as.character(chromosome))),
+    outcome_tri_category = standardise_outcome_tri(outcome_tri_category),
+    outcome_tri_category = factor(
+      outcome_tri_category,
+      levels = diagnostic_labels
+    )
+  ) %>%
+  filter(
+    chromosome_num %in% 1:22
+  )
+
+# ------------------------------------------------------------------------------
+# 12.3 Calculate 50 kb bin-level copy-number dispersion per scroll-set
+# ------------------------------------------------------------------------------
+
+dispersion_50kb_bins <- sponge_CN_50kb_long_annot %>%
+  group_by(
+    sequencing_ID,
+    specimen_ID,
+    case_ID,
+    outcome_tri_category
+  ) %>%
+  summarise(
+    n_bins = n(),
+    dispersion_50kb_bin_sd = sd(segmented_CN, na.rm = TRUE),
+    median_50kb_CN = median(segmented_CN, na.rm = TRUE),
+    mean_50kb_CN = mean(segmented_CN, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Basic checks
+cat("\n--- Scroll-set counts by diagnostic group ---\n")
+print(table(dispersion_50kb_bins$outcome_tri_category, useNA = "ifany"))
+
+cat("\n--- Number of scroll-sets ---\n")
+print(nrow(dispersion_50kb_bins))
+
+cat("\n--- Number of bins per scroll-set ---\n")
+dispersion_50kb_bins %>%
+  count(n_bins) %>%
+  arrange(n_bins) %>%
+  print(n = Inf)
+
+# ------------------------------------------------------------------------------
+# 12.4 Group-level summary 
+# ------------------------------------------------------------------------------
+
+summary_50kb_bins <- dispersion_50kb_bins %>%
+  group_by(outcome_tri_category) %>%
+  summarise(
+    n_scrollsets = n(),
+    n_patients = n_distinct(case_ID),
+    median_sd = median(dispersion_50kb_bin_sd, na.rm = TRUE),
+    mean_sd = mean(dispersion_50kb_bin_sd, na.rm = TRUE),
+    q1_sd = quantile(dispersion_50kb_bin_sd, 0.25, na.rm = TRUE),
+    q3_sd = quantile(dispersion_50kb_bin_sd, 0.75, na.rm = TRUE),
+    min_sd = min(dispersion_50kb_bin_sd, na.rm = TRUE),
+    max_sd = max(dispersion_50kb_bin_sd, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(summary_50kb_bins, n = Inf)
+
+summary_50kb_bins_for_text <- summary_50kb_bins %>%
+  mutate(
+    median_sd_text = sprintf("%.4f", median_sd),
+    q1_q3_text = sprintf("%.4f–%.4f", q1_sd, q3_sd)
+  )
+
+print(summary_50kb_bins_for_text, n = Inf)
+
+# ------------------------------------------------------------------------------
+# 12.5 Kruskal-Wallis test across diagnostic groups
+# ------------------------------------------------------------------------------
+
+kw_50kb_sd <- kruskal.test(
+  dispersion_50kb_bin_sd ~ outcome_tri_category,
+  data = dispersion_50kb_bins
+)
+
+kw_50kb_sd_tbl <- tibble(
+  test = "Kruskal-Wallis",
+  variable = "dispersion_50kb_bin_sd",
+  statistic = unname(kw_50kb_sd$statistic),
+  df = unname(kw_50kb_sd$parameter),
+  p_value = kw_50kb_sd$p.value,
+  p_adj_BH = p.adjust(kw_50kb_sd$p.value, method = "BH")
+)
+
+print(kw_50kb_sd_tbl)
+
+# ------------------------------------------------------------------------------
+# 12.6 Post-hoc Dunn tests with Benjamini-Hochberg FDR adjustment
+# ------------------------------------------------------------------------------
+
+dunn_50kb_sd <- rstatix::dunn_test(
+  data = dispersion_50kb_bins,
+  formula = dispersion_50kb_bin_sd ~ outcome_tri_category,
+  p.adjust.method = "BH"
+) %>%
+  mutate(
+    p = as.numeric(p),
+    p.adj = as.numeric(p.adj)
+  )
+
+print(dunn_50kb_sd, n = Inf)
+
+# ------------------------------------------------------------------------------
+# 12.7 Formatted p-values
+# ------------------------------------------------------------------------------
+
+format_p_for_text <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.001 ~ formatC(p, format = "e", digits = 2),
+    TRUE ~ formatC(p, format = "f", digits = 4)
+  )
+}
+
+kw_50kb_sd_for_text <- kw_50kb_sd_tbl %>%
+  mutate(
+    p_value_text = format_p_for_text(p_value),
+    p_adj_BH_text = format_p_for_text(p_adj_BH)
+  )
+
+dunn_50kb_sd_for_text <- dunn_50kb_sd %>%
+  mutate(
+    p_text = format_p_for_text(p),
+    p_adj_text = format_p_for_text(p.adj)
+  ) %>%
+  select(
+    group1,
+    group2,
+    statistic,
+    p,
+    p.adj,
+    p_text,
+    p_adj_text
+  )
+
+cat("\n--- Summary values ---\n")
+print(summary_50kb_bins_for_text, n = Inf, width = Inf)
+
+cat("\n--- Kruskal-Wallis formatted for text ---\n")
+print(kw_50kb_sd_for_text)
+
+cat("\n--- Dunn tests formatted for text ---\n")
+print(dunn_50kb_sd_for_text, n = Inf)
+
+
+# ------------------------------------------------------------------------------
+# 11.12 Save output tables
+# ------------------------------------------------------------------------------
+
+readr::write_tsv(
+  dispersion_50kb_bins,
+  file.path(tables_dir, "scrollset_level_50kb_copy_number_dispersion.tsv")
+)
+
+readr::write_csv(
+  dispersion_50kb_bins,
+  file.path(tables_dir, "scrollset_level_50kb_copy_number_dispersion.csv")
+)
+
+readr::write_tsv(
+  summary_50kb_bins,
+  file.path(tables_dir, "summary_50kb_copy_number_dispersion_by_diagnostic_group.tsv")
+)
+
+readr::write_csv(
+  summary_50kb_bins,
+  file.path(tables_dir, "summary_50kb_copy_number_dispersion_by_diagnostic_group.csv")
+)
+
+readr::write_tsv(
+  kw_50kb_sd_tbl,
+  file.path(tables_dir, "kruskal_wallis_50kb_copy_number_dispersion.tsv")
+)
+
+readr::write_csv(
+  kw_50kb_sd_tbl,
+  file.path(tables_dir, "kruskal_wallis_50kb_copy_number_dispersion.csv")
+)
+
+readr::write_tsv(
+  dunn_50kb_sd,
+  file.path(tables_dir, "dunn_tests_50kb_copy_number_dispersion_BH.tsv")
+)
+
+readr::write_csv(
+  dunn_50kb_sd,
+  file.path(tables_dir, "dunn_tests_50kb_copy_number_dispersion_BH.csv")
+)
+
+
+# ==============================================================================
+# 13. Microdissected ESD tissue analysis
+#     Figure 5B and Figure 5C
+#
+#     Progression series: ST-NC → ANSE → LG-IEN → HG-IEN → OSCC
+#
+#     Figure 5B:
+#       Radar plot of key-arm alteration prevalence across pathology states
+#
+#     Figure 5C:
+#       Genome-wide CNA burden across pathology states
+# ==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(rstatix)
+library(ggsignif)
+library(fmsb)
+library(scales)
+
+# ------------------------------------------------------------------------------
+# 13.1 Load and tidy ESD data
+# ------------------------------------------------------------------------------
+
+# Use esd_data if already loaded earlier.
+# Otherwise, read from data_dir.
+if (!exists("esd_data")) {
+  esd_data <- readr::read_tsv(
+    file.path(data_dir, "esd_segments.tsv"),
+    col_types = cols()
+  )
+}
+
+
+esd_data_13 <- esd_data %>%
+  mutate(
+    Specimen_pathology = dplyr::recode(
+      as.character(Specimen_pathology),
+      "Reference" = "ST-NC",
+      "Normal_epithelium" = "ANSE",
+      "LGD" = "LG-IEN",
+      "HGD" = "HG-IEN",
+      "OSCC" = "OSCC",
+      "ST-NC" = "ST-NC",
+      "ANSE" = "ANSE",
+      "LG-IEN" = "LG-IEN",
+      "HG-IEN" = "HG-IEN",
+      .default = as.character(Specimen_pathology)
+    ),
+    Specimen_pathology = factor(
+      Specimen_pathology,
+      levels = c("ST-NC", "ANSE", "LG-IEN", "HG-IEN", "OSCC")
+    )
+  )
+
+cat("\n--- ESD pathology counts ---\n")
+print(table(esd_data_13$Specimen_pathology, useNA = "ifany"))
+
+if (any(is.na(esd_data_13$Specimen_pathology))) {
+  stop("Some ESD pathology labels did not map correctly. Check unique(esd_data$Specimen_pathology).")
+}
+
+# ------------------------------------------------------------------------------
+# 13.2 Call altered 50 kb bins using arm-wise ST-NC robust control bounds
+# ------------------------------------------------------------------------------
+
+esd_control_bounds <- esd_data_13 %>%
+  filter(Specimen_pathology == "ST-NC") %>%
+  group_by(chromosomal_arm) %>%
+  summarise(
+    med = median(segmented_CN, na.rm = TRUE),
+    iqr = IQR(segmented_CN, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    lower = med - 1.5 * iqr,
+    upper = med + 1.5 * iqr
+  )
+
+esd_altered <- esd_data_13 %>%
+  left_join(esd_control_bounds, by = "chromosomal_arm") %>%
+  mutate(
+    is_altered = if_else(
+      segmented_CN < lower | segmented_CN > upper,
+      1L,
+      0L
+    )
+  )
+
+cat("\n--- ESD altered-bin summary ---\n")
+print(
+  esd_altered %>%
+    summarise(
+      n_bins = n(),
+      n_altered = sum(is_altered, na.rm = TRUE),
+      pct_altered = 100 * mean(is_altered, na.rm = TRUE)
+    )
+)
+
+# ------------------------------------------------------------------------------
+# 13.3 Genome-wide CNA burden per microdissected region
+# ------------------------------------------------------------------------------
+
+esd_burden <- esd_altered %>%
+  group_by(SpecimenID, Specimen_pathology) %>%
+  summarise(
+    altered = sum(is_altered, na.rm = TRUE),
+    total = n(),
+    gw_cna_burden = altered / total,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Specimen_pathology = factor(
+      Specimen_pathology,
+      levels = c("ST-NC", "ANSE", "LG-IEN", "HG-IEN", "OSCC")
+    )
+  )
+
+# Threshold = 95th percentile of ST-NC burden
+esd_gw_thr <- esd_burden %>%
+  filter(Specimen_pathology == "ST-NC") %>%
+  summarise(
+    threshold = quantile(gw_cna_burden, 0.95, na.rm = TRUE)
+  ) %>%
+  pull(threshold)
+
+esd_burden <- esd_burden %>%
+  mutate(
+    unstable = gw_cna_burden >= esd_gw_thr
+  )
+
+cat("\n--- ESD GW-CNA burden threshold ---\n")
+cat("95th percentile of ST-NC =", sprintf("%.6f", esd_gw_thr), "\n")
+
+# ------------------------------------------------------------------------------
+# 13.4 Summary statistics 
+# ------------------------------------------------------------------------------
+
+esd_burden_summary <- esd_burden %>%
+  group_by(Specimen_pathology) %>%
+  summarise(
+    n_regions = n(),
+    median_burden = median(gw_cna_burden, na.rm = TRUE),
+    mean_burden = mean(gw_cna_burden, na.rm = TRUE),
+    q1_burden = quantile(gw_cna_burden, 0.25, na.rm = TRUE),
+    q3_burden = quantile(gw_cna_burden, 0.75, na.rm = TRUE),
+    iqr_burden = IQR(gw_cna_burden, na.rm = TRUE),
+    min_burden = min(gw_cna_burden, na.rm = TRUE),
+    max_burden = max(gw_cna_burden, na.rm = TRUE),
+    n_unstable = sum(unstable, na.rm = TRUE),
+    pct_unstable = 100 * mean(unstable, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    median_iqr_text = sprintf("%.3f [%.3f]", median_burden, iqr_burden),
+    q1_q3_text = sprintf("%.3f–%.3f", q1_burden, q3_burden),
+    unstable_text = sprintf("%d/%d (%.1f%%)", n_unstable, n_regions, pct_unstable)
+  )
+
+cat("\n--- ESD GW-CNA burden summary by pathology ---\n")
+print(esd_burden_summary, n = Inf)
+
+# ------------------------------------------------------------------------------
+# 13.5 Statistical comparison across pathology stages
+# ------------------------------------------------------------------------------
+
+kw_esd <- rstatix::kruskal_test(
+  gw_cna_burden ~ Specimen_pathology,
+  data = esd_burden
+)
+
+dunn_esd <- rstatix::dunn_test(
+  gw_cna_burden ~ Specimen_pathology,
+  data = esd_burden,
+  p.adjust.method = "hochberg"
+)
+
+cat("\n--- ESD GW-CNA burden Kruskal-Wallis test ---\n")
+print(kw_esd)
+
+cat("\n--- ESD GW-CNA burden Dunn post-hoc tests ---\n")
+print(dunn_esd, n = Inf)
+
+# Keep only selected OSCC comparisons for plot brackets
+esd_pairs_keep <- tibble::tribble(
+  ~group1, ~group2,
+  "ST-NC", "OSCC",
+  "ANSE",  "OSCC"
+)
+
+dunn_keep_esd <- dunn_esd %>%
+  semi_join(esd_pairs_keep, by = c("group1", "group2")) %>%
+  arrange(match(group1, levels(esd_burden$Specimen_pathology))) %>%
+  mutate(
+    p_label = p.adj.signif
+  )
+
+comparisons_esd <- dunn_keep_esd %>%
+  transmute(comp = Map(c, group1, group2)) %>%
+  pull(comp)
+
+y_max_esd <- max(esd_burden$gw_cna_burden, na.rm = TRUE)
+
+dunn_keep_esd <- dunn_keep_esd %>%
+  mutate(
+    ypos = y_max_esd + seq(0.08, 0.12, length.out = n())
+  )
+
+# ------------------------------------------------------------------------------
+# 13.6 Colour palette for ESD pathology states
+# ------------------------------------------------------------------------------
+
+cols_pathology <- c(
+  "ST-NC"  = "#ff7f0e",
+  "ANSE"   = "#9467bd",
+  "LG-IEN" = "#2ca02c",
+  "HG-IEN" = "#1f77b4",
+  "OSCC"   = "#d62728"
+)
+
+x_levels_esd <- c("ST-NC", "ANSE", "LG-IEN", "HG-IEN", "OSCC")
+
+# ------------------------------------------------------------------------------
+# 13.7 Figure 5C: ESD genome-wide CNA burden boxplot
+# ------------------------------------------------------------------------------
+
+p_esd_burden <- ggplot(
+  esd_burden,
+  aes(
+    x = Specimen_pathology,
+    y = gw_cna_burden,
+    fill = Specimen_pathology
+  )
+) +
+  scale_x_discrete(
+    limits = x_levels_esd,
+    drop = FALSE
+  ) +
+  geom_boxplot(
+    width = 0.5,
+    outlier.shape = NA,
+    linewidth = 0.6,
+    colour = "black"
+  ) +
+  scale_fill_manual(
+    values = cols_pathology,
+    guide = "none"
+  ) +
+  ggsignif::geom_signif(
+    comparisons = comparisons_esd,
+    annotations = dunn_keep_esd$p_label,
+    y_position = dunn_keep_esd$ypos,
+    tip_length = 0.01,
+    vjust = 0.4,
+    textsize = 4,
+    linewidth = 0.6
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  coord_cartesian(
+    ylim = c(0, max(dunn_keep_esd$ypos, na.rm = TRUE) + 0.06),
+    clip = "off"
+  ) +
+  labs(
+    x = "Sample pathology",
+    y = "Genome-wide CNA burden"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.major.y = element_line(colour = "grey88", linewidth = 0.45),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(colour = "black", linewidth = 0.6),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold")
+  )
+
+print(p_esd_burden)
+
+ggsave(
+  file.path(fig_dir, "Figure_5C.pdf"),
+  p_esd_burden,
+  width = 6.4,
+  height = 5.6,
+  units = "in",
+  dpi = 600,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "Figure_5C.png"),
+  p_esd_burden,
+  width = 6.4,
+  height = 5.6,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+
+# ------------------------------------------------------------------------------
+# 13.8 Figure 5B: Radar plot of key-arm alteration prevalence
+# ------------------------------------------------------------------------------
+
+key_arms_esd <- c("chr2q", "chr3q", "chr9p", "chr11q")
+
+per_sample_arm_esd <- esd_altered %>%
+  filter(chromosomal_arm %in% key_arms_esd) %>%
+  group_by(SpecimenID, Specimen_pathology, chromosomal_arm) %>%
+  summarise(
+    prop_altered = mean(is_altered, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+mean_per_pathology_esd <- per_sample_arm_esd %>%
+  group_by(Specimen_pathology, chromosomal_arm) %>%
+  summarise(
+    mean_prop = mean(prop_altered, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+spoke_order_esd <- c("chr11q", "chr9p", "chr3q", "chr2q")
+
+mean_per_pathology_esd <- mean_per_pathology_esd %>%
+  mutate(
+    chromosomal_arm = factor(
+      chromosomal_arm,
+      levels = spoke_order_esd
+    )
+  )
+
+radar_mat_esd <- mean_per_pathology_esd %>%
+  arrange(chromosomal_arm) %>%
+  pivot_wider(
+    names_from = chromosomal_arm,
+    values_from = mean_prop
+  ) %>%
+  mutate(
+    across(
+      all_of(spoke_order_esd),
+      ~ 100 * .x
+    )
+  ) %>%
+  arrange(
+    factor(
+      Specimen_pathology,
+      levels = x_levels_esd
+    )
+  ) %>%
+  column_to_rownames("Specimen_pathology") %>%
+  as.data.frame()
+
+radar_mat_esd[is.na(radar_mat_esd)] <- 0
+
+radar_bounds_esd <- rbind(
+  max = setNames(rep(100, ncol(radar_mat_esd)), colnames(radar_mat_esd)),
+  min = setNames(rep(0,   ncol(radar_mat_esd)), colnames(radar_mat_esd))
+)
+
+radar_df_esd <- rbind(
+  radar_bounds_esd,
+  radar_mat_esd
+)
+
+group_levels_esd <- rownames(radar_mat_esd)
+line_cols_esd <- cols_pathology[group_levels_esd]
+fill_cols_esd <- scales::alpha(line_cols_esd, 0.18)
+
+# ------------------------------------------------------------------------------
+# Export Figure 5B as PDF and PNG
+# ------------------------------------------------------------------------------
+
+plot_esd_radar <- function() {
+  
+  op <- par(mar = c(1, 2, 2, 2), xpd = NA)
+  on.exit(par(op))
+  
+  fmsb::radarchart(
+    radar_df_esd,
+    axistype = 1,
+    seg = 4,
+    caxislabels = c("0%", "25%", "50%", "75%", "100%"),
+    cglcol = "grey85",
+    cglty = 1,
+    cglwd = 0.8,
+    vlabels = colnames(radar_df_esd),
+    vlcex = 1.0,
+    pcol = line_cols_esd,
+    pfcol = fill_cols_esd,
+    plwd = 2.2,
+    plty = 1
+  )
+  
+  legend(
+    "bottom",
+    legend = group_levels_esd,
+    horiz = TRUE,
+    bty = "n",
+    col = line_cols_esd,
+    lwd = 3,
+    pt.cex = 1.8,
+    cex = 0.95,
+    xpd = NA,
+    inset = -0.02
+  )
+}
+
+# PDF export
+pdf(
+  file.path(fig_dir, "Figure_5B.pdf"),
+  width = 6.2,
+  height = 7,
+  useDingbats = FALSE
+)
+
+plot_esd_radar()
+
+dev.off()
+
+# PNG export
+png(
+  file.path(fig_dir, "Figure_5B.png"),
+  width = 6.2,
+  height = 7,
+  units = "in",
+  res = 600,
+  type = "cairo",
+  bg = "white"
+)
+
+plot_esd_radar()
+
+dev.off()
+# ------------------------------------------------------------------------------
+# 13.9 Save ESD analysis tables
+# ------------------------------------------------------------------------------
+
+readr::write_tsv(
+  esd_control_bounds,
+  file.path(tables_dir, "Figure_5B_5C_ESD_control_bounds_by_arm.tsv")
+)
+
+readr::write_csv(
+  esd_control_bounds,
+  file.path(tables_dir, "Figure_5B_5C_ESD_control_bounds_by_arm.csv")
+)
+
+readr::write_tsv(
+  esd_burden,
+  file.path(tables_dir, "Figure_5C_ESD_GW_CNA_burden_per_region.tsv")
+)
+
+readr::write_csv(
+  esd_burden,
+  file.path(tables_dir, "Figure_5C_ESD_GW_CNA_burden_per_region.csv")
+)
+
+readr::write_tsv(
+  esd_burden_summary,
+  file.path(tables_dir, "Figure_5C_ESD_GW_CNA_burden_summary_by_pathology.tsv")
+)
+
+readr::write_csv(
+  esd_burden_summary,
+  file.path(tables_dir, "Figure_5C_ESD_GW_CNA_burden_summary_by_pathology.csv")
+)
+
+readr::write_tsv(
+  kw_esd,
+  file.path(tables_dir, "Figure_5C_ESD_GW_CNA_burden_kruskal_wallis.tsv")
+)
+
+readr::write_csv(
+  kw_esd,
+  file.path(tables_dir, "Figure_5C_ESD_GW_CNA_burden_kruskal_wallis.csv")
+)
+
+readr::write_tsv(
+  dunn_esd,
+  file.path(tables_dir, "Figure_5C_ESD_GW_CNA_burden_dunn_tests_hochberg.tsv")
+)
+
+readr::write_csv(
+  dunn_esd,
+  file.path(tables_dir, "Figure_5C_ESD_GW_CNA_burden_dunn_tests_hochberg.csv")
+)
+
+readr::write_tsv(
+  mean_per_pathology_esd,
+  file.path(tables_dir, "Figure_5B_ESD_key_arm_mean_alteration_prevalence.tsv")
+)
+
+readr::write_csv(
+  mean_per_pathology_esd,
+  file.path(tables_dir, "Figure_5B_ESD_key_arm_mean_alteration_prevalence.csv")
+)
+
+# ------------------------------------------------------------------------------
+# 13.10 Final printed values
+# ------------------------------------------------------------------------------
+
+cat("\n============================================================\n")
+cat("Final ESD tissue results\n")
+cat("============================================================\n\n")
+
+cat("--- ESD GW-CNA burden summary by pathology ---\n")
+print(esd_burden_summary, n = Inf, width = Inf)
+
+cat("\n--- ESD GW-CNA burden threshold ---\n")
+cat("95th percentile of ST-NC =", sprintf("%.6f", esd_gw_thr), "\n")
+
+cat("\n--- ESD Kruskal-Wallis test ---\n")
+print(kw_esd)
+
+cat("\n--- ESD Dunn post-hoc tests ---\n")
+print(dunn_esd, n = Inf)
+
+cat("\n--- ESD key-arm mean alteration prevalence for radar plot ---\n")
+print(mean_per_pathology_esd, n = Inf)
+
+# ------------------------------------------------------------------------------
+# 13.11 Binary key-arm alteration prevalence 
+# ------------------------------------------------------------------------------
+
+key_arms_esd <- c("chr2q", "chr3q", "chr9p", "chr11q")
+
+# Calculate arm-level alteration density per ESD region
+esd_arm_level_density <- esd_altered %>%
+  filter(chromosomal_arm %in% key_arms_esd) %>%
+  group_by(SpecimenID, Specimen_pathology, chromosomal_arm) %>%
+  summarise(
+    altered_segments = sum(is_altered, na.rm = TRUE),
+    total_segments = n(),
+    alteration_density = altered_segments / total_segments,
+    .groups = "drop"
+  )
+
+# 95th percentile of Reference/ST-NC density across the four key arms
+esd_key_arm_density <- esd_altered %>%
+  filter(chromosomal_arm %in% key_arms_esd) %>%
+  group_by(SpecimenID, Specimen_pathology) %>%
+  summarise(
+    altered_segments = sum(is_altered, na.rm = TRUE),
+    total_segments = n(),
+    key_arm_density = altered_segments / total_segments,
+    .groups = "drop"
+  )
+
+esd_key_arm_threshold <- quantile(
+  esd_key_arm_density %>%
+    filter(Specimen_pathology == "ST-NC") %>%
+    pull(key_arm_density),
+  probs = 0.95,
+  na.rm = TRUE
+)
+
+cat("\n--- ESD key-arm alteration threshold ---\n")
+cat("95th percentile of ST-NC key-arm density =", sprintf("%.6f", esd_key_arm_threshold), "\n")
+
+# Classify each sample-arm as altered/not altered
+esd_alteration_status <- esd_arm_level_density %>%
+  mutate(
+    is_arm_altered = if_else(
+      alteration_density >= esd_key_arm_threshold,
+      1L,
+      0L
+    )
+  )
+
+# Summarise n/N prevalence by arm and pathology group
+esd_arm_alteration_summary <- esd_alteration_status %>%
+  group_by(chromosomal_arm, Specimen_pathology) %>%
+  summarise(
+    altered = sum(is_arm_altered, na.rm = TRUE),
+    total = n_distinct(SpecimenID),
+    frequency = 100 * altered / total,
+    label = paste0(altered, "/", total, " (", round(frequency, 1), "%)"),
+    .groups = "drop"
+  ) %>%
+  arrange(
+    factor(chromosomal_arm, levels = key_arms_esd),
+    Specimen_pathology
+  )
+
+cat("\n--- ESD binary key-arm alteration prevalence ---\n")
+print(esd_arm_alteration_summary, n = Inf)
+
+# Wider table 
+esd_arm_alteration_summary_wide <- esd_arm_alteration_summary %>%
+  select(chromosomal_arm, Specimen_pathology, label) %>%
+  pivot_wider(
+    names_from = Specimen_pathology,
+    values_from = label
+  )
+
+cat("\n--- ESD binary key-arm alteration prevalence, wide format ---\n")
+print(esd_arm_alteration_summary_wide, n = Inf)
+
+# At least one alteration in any of the four key arms
+esd_any_key_arm_alteration <- esd_alteration_status %>%
+  group_by(SpecimenID, Specimen_pathology) %>%
+  summarise(
+    has_any_key_arm_alteration = any(is_arm_altered == 1),
+    .groups = "drop"
+  )
+
+esd_any_key_arm_summary <- esd_any_key_arm_alteration %>%
+  group_by(Specimen_pathology) %>%
+  summarise(
+    samples_with_alteration = sum(has_any_key_arm_alteration, na.rm = TRUE),
+    total_samples = n_distinct(SpecimenID),
+    percent_with_alteration = 100 * samples_with_alteration / total_samples,
+    label = paste0(
+      samples_with_alteration,
+      "/",
+      total_samples,
+      " (",
+      round(percent_with_alteration, 1),
+      "%)"
+    ),
+    .groups = "drop"
+  )
+
+cat("\n--- ESD samples with at least one key-arm alteration ---\n")
+print(esd_any_key_arm_summary, n = Inf)
+
+# Optional: list altered arms per sample
+esd_altered_arms_per_sample <- esd_alteration_status %>%
+  filter(is_arm_altered == 1) %>%
+  group_by(SpecimenID, Specimen_pathology) %>%
+  summarise(
+    altered_arms = paste(sort(unique(chromosomal_arm)), collapse = ", "),
+    n_altered_arms = n_distinct(chromosomal_arm),
+    .groups = "drop"
+  )
+
+esd_all_key_arm_samples <- esd_alteration_status %>%
+  distinct(SpecimenID, Specimen_pathology)
+
+esd_altered_arms_summary <- esd_all_key_arm_samples %>%
+  left_join(
+    esd_altered_arms_per_sample,
+    by = c("SpecimenID", "Specimen_pathology")
+  ) %>%
+  mutate(
+    altered_arms = if_else(is.na(altered_arms), "None", altered_arms),
+    n_altered_arms = if_else(is.na(n_altered_arms), 0L, n_altered_arms)
+  )
+
+cat("\n--- ESD altered arms per sample ---\n")
+print(esd_altered_arms_summary, n = Inf)
+
+# ------------------------------------------------------------------------------
+# 13.12 Ordered trend tests for binary key-arm alteration prevalence
+# ------------------------------------------------------------------------------
+
+pathology_levels_esd <- c("ST-NC", "ANSE", "LG-IEN", "HG-IEN", "OSCC")
+pathology_scores_esd <- seq_along(pathology_levels_esd)
+
+format_p_for_text <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.001 ~ formatC(p, format = "e", digits = 2),
+    TRUE ~ formatC(p, format = "f", digits = 4)
+  )
+}
+
+run_ordered_trend_test <- function(df, binary_col, feature_name) {
+  
+  test_df <- df %>%
+    mutate(
+      Specimen_pathology = factor(
+        Specimen_pathology,
+        levels = pathology_levels_esd
+      ),
+      binary_value = as.integer(.data[[binary_col]])
+    )
+  
+  counts_df <- test_df %>%
+    group_by(Specimen_pathology) %>%
+    summarise(
+      altered = sum(binary_value == 1, na.rm = TRUE),
+      total = n_distinct(SpecimenID),
+      frequency = 100 * altered / total,
+      .groups = "drop"
+    ) %>%
+    arrange(Specimen_pathology)
+  
+  trend_res <- prop.trend.test(
+    x = counts_df$altered,
+    n = counts_df$total,
+    score = pathology_scores_esd
+  )
+  
+  tibble::tibble(
+    feature = feature_name,
+    test = "Cochran-Armitage ordered trend test",
+    statistic = unname(trend_res$statistic),
+    df = unname(trend_res$parameter),
+    p_value = trend_res$p.value
+  )
+}
+
+# Trend tests for each individual key arm
+esd_key_arm_trend_tests <- purrr::map_dfr(
+  key_arms_esd,
+  function(arm_now) {
+    run_ordered_trend_test(
+      df = esd_alteration_status %>%
+        filter(chromosomal_arm == arm_now),
+      binary_col = "is_arm_altered",
+      feature_name = arm_now
+    )
+  }
+)
+
+# Trend test for alteration in at least one of the four key arms
+esd_any_key_arm_trend_test <- run_ordered_trend_test(
+  df = esd_any_key_arm_alteration,
+  binary_col = "has_any_key_arm_alteration",
+  feature_name = "Any key arm"
+)
+
+# Combine and adjust across the five reported trend tests
+esd_trend_tests_for_text <- bind_rows(
+  esd_key_arm_trend_tests,
+  esd_any_key_arm_trend_test
+) %>%
+  mutate(
+    p_adj_hochberg = p.adjust(p_value, method = "hochberg"),
+    p_adj_BH = p.adjust(p_value, method = "BH"),
+    p_value_text = format_p_for_text(p_value),
+    p_adj_hochberg_text = format_p_for_text(p_adj_hochberg),
+    p_adj_BH_text = format_p_for_text(p_adj_BH)
+  ) %>%
+  arrange(
+    factor(feature, levels = c("chr2q", "chr3q", "chr9p", "chr11q", "Any key arm"))
+  )
+
+cat("\n--- ESD ordered trend tests for binary key-arm alteration prevalence ---\n")
+print(esd_trend_tests_for_text, n = Inf)
+
+# Save trend-test results 
+readr::write_tsv(
+  esd_trend_tests_for_text,
+  file.path(tables_dir, "Figure_5B_ESD_binary_key_arm_ordered_trend_tests.tsv")
+)
+
+readr::write_csv(
+  esd_trend_tests_for_text,
+  file.path(tables_dir, "Figure_5B_ESD_binary_key_arm_ordered_trend_tests.csv")
+)
+```
+
+
+```{r}
+# ==============================================================================
+# 14. Sensitivity analysis: repeated scroll-sets and patient-level performance
+# ==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(geepack)
+library(pROC)
+
+
+# ------------------------------------------------------------------------------
+# Create complete-case dataframe for GEE analysis
+# ------------------------------------------------------------------------------
+
+# This keeps case_ID for participant-level clustering.
+# It does not overwrite the original model_df_cc used for the original caret models.
+
+gee_required_vars <- unique(c(
+  "case_ID",
+  target,
+  copy_number_continuous,
+  copy_number_binary,
+  pathology_vars
+))
+
+missing_gee_vars <- setdiff(gee_required_vars, names(model_df))
+if (length(missing_gee_vars) > 0) {
+  stop(
+    "The following variables are missing from model_df for the GEE sensitivity analysis: ",
+    paste(missing_gee_vars, collapse = ", ")
+  )
+}
+
+model_df_cc_gee <- model_df %>%
+  dplyr::select(all_of(gee_required_vars)) %>%
+  tidyr::drop_na()
+
+cat("\n--- GEE complete-case dataframe columns ---\n")
+print(names(model_df_cc_gee))
+
+cat("\n--- GEE complete-case outcome counts ---\n")
+print(table(model_df_cc_gee$endoscopy_outcome_binarized))
+
+cat("\n--- GEE complete-case participant/scroll-set counts ---\n")
+print(
+  model_df_cc_gee %>%
+    summarise(
+      n_scrollsets = n(),
+      n_patients = n_distinct(case_ID),
+      n_non_IEN_early_cancer_scrollsets = sum(endoscopy_outcome_binarized == "X0"),
+      n_IEN_early_cancer_scrollsets = sum(endoscopy_outcome_binarized == "X1"),
+      n_non_IEN_early_cancer_patients = n_distinct(case_ID[endoscopy_outcome_binarized == "X0"]),
+      n_IEN_early_cancer_patients = n_distinct(case_ID[endoscopy_outcome_binarized == "X1"])
+    )
+)
+
+# ------------------------------------------------------------------------------
+# Prepare  GEE dataframe
+# ------------------------------------------------------------------------------
+
+gee_df_raw <- model_df_cc_gee %>%
+  mutate(
+    outcome_gee = case_when(
+      endoscopy_outcome_binarized == "X1" ~ 1,
+      endoscopy_outcome_binarized == "X0" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    cluster_id = as.integer(factor(case_ID)),
+    
+    genome_wide_CNA_burden_binary = factor(
+      as.character(genome_wide_CNA_burden_binary),
+      levels = c("Low burden", "High burden")
+    ),
+    
+    cytosponge_definite_sq_atypia = factor(
+      as.character(cytosponge_definite_sq_atypia),
+      levels = c("0", "1")
+    ),
+    
+    p53_staining_binarized = factor(
+      as.character(p53_staining_binarized),
+      levels = c("0", "1")
+    )
+  ) %>%
+  filter(!is.na(outcome_gee)) %>%
+  arrange(cluster_id)
+
+cat("\n--- Raw GEE cluster check ---\n")
+
+gee_cluster_check_raw <- gee_df_raw %>%
+  summarise(
+    n_scrollsets = n(),
+    n_patients = n_distinct(case_ID),
+    n_clusters = n_distinct(cluster_id),
+    max_scrollsets_per_patient = max(as.numeric(table(case_ID))),
+    n_X0_scrollsets = sum(outcome_gee == 0),
+    n_X1_scrollsets = sum(outcome_gee == 1),
+    n_X0_patients = n_distinct(case_ID[outcome_gee == 0]),
+    n_X1_patients = n_distinct(case_ID[outcome_gee == 1])
+  )
+
+print(gee_cluster_check_raw)
+
+stopifnot(gee_cluster_check_raw$n_clusters == gee_cluster_check_raw$n_patients)
+
+# ------------------------------------------------------------------------------
+# Define  model features
+# ------------------------------------------------------------------------------
+
+gee_model_features_raw <- list(
+  "Continuous genomic model" = c(
+    "genome_wide_CNA_burden",
+    "chr2q",
+    "chr3q",
+    "chr9p",
+    "chr11q"
+  ),
+  
+  "Binary genomic model" = c(
+    "genome_wide_CNA_burden_binary",
+    "chr2q",
+    "chr3q",
+    "chr9p",
+    "chr11q"
+  ),
+  
+  "Pathology model" = c(
+    "cytosponge_definite_sq_atypia",
+    "p53_staining_binarized"
+  )
+)
+
+# ------------------------------------------------------------------------------
+# Helper functions for  GEE
+# ------------------------------------------------------------------------------
+
+make_gee_formula_raw <- function(features) {
+  as.formula(
+    paste("outcome_gee ~", paste(features, collapse = " + "))
+  )
+}
+
+fit_gee_model_raw <- function(df, features) {
+  geepack::geeglm(
+    formula = make_gee_formula_raw(features),
+    id = cluster_id,
+    data = df,
+    family = binomial(link = "logit"),
+    corstr = "independence",
+    control = geepack::geese.control(maxit = 100)
+  )
+}
+
+calculate_diagnostic_metrics_raw <- function(df, truth_col = "outcome_gee", pred_col = "pred_prob") {
+  
+  roc_obj <- pROC::roc(
+    response = df[[truth_col]],
+    predictor = df[[pred_col]],
+    levels = c(0, 1),
+    direction = "<",
+    quiet = TRUE
+  )
+  
+  auc_value <- as.numeric(pROC::auc(roc_obj))
+  
+  best_coords <- pROC::coords(
+    roc_obj,
+    x = "best",
+    best.method = "youden",
+    ret = c("threshold", "sensitivity", "specificity"),
+    transpose = FALSE
+  )
+  
+  best_coords <- as.data.frame(best_coords)
+  threshold <- as.numeric(best_coords$threshold[1])
+  
+  df_classified <- df %>%
+    mutate(
+      pred_class = if_else(.data[[pred_col]] >= threshold, 1, 0)
+    )
+  
+  tp <- sum(df_classified$pred_class == 1 & df_classified[[truth_col]] == 1, na.rm = TRUE)
+  tn <- sum(df_classified$pred_class == 0 & df_classified[[truth_col]] == 0, na.rm = TRUE)
+  fp <- sum(df_classified$pred_class == 1 & df_classified[[truth_col]] == 0, na.rm = TRUE)
+  fn <- sum(df_classified$pred_class == 0 & df_classified[[truth_col]] == 1, na.rm = TRUE)
+  
+  tibble(
+    auc = auc_value,
+    threshold = threshold,
+    sensitivity = tp / (tp + fn),
+    specificity = tn / (tn + fp),
+    accuracy = (tp + tn) / (tp + tn + fp + fn),
+    ppv = tp / (tp + fp),
+    npv = tn / (tn + fn),
+    tp = tp,
+    tn = tn,
+    fp = fp,
+    fn = fn
+  )
+}
+
+run_gee_model_raw <- function(df, features, model_name) {
+  
+  gee_fit <- fit_gee_model_raw(df, features)
+  
+  n_clusters_used <- length(gee_fit$geese$clusz)
+  
+  if (n_clusters_used != n_distinct(df$cluster_id)) {
+    stop(
+      "Raw/unscaled GEE clustering failed for ", model_name,
+      ". Expected ", n_distinct(df$cluster_id),
+      " clusters but got ", n_clusters_used, "."
+    )
+  }
+  
+  df_pred <- df %>%
+    mutate(
+      pred_prob = as.numeric(predict(gee_fit, type = "response"))
+    )
+  
+  scrollset_metrics <- calculate_diagnostic_metrics_raw(df_pred) %>%
+    mutate(
+      model = model_name,
+      analysis_level = "Scroll-set-level GEE prediction",
+      scaling = "Unscaled"
+    )
+  
+  patient_pred <- df_pred %>%
+    group_by(case_ID) %>%
+    summarise(
+      outcome_gee = first(outcome_gee),
+      pred_prob = mean(pred_prob, na.rm = TRUE),
+      n_scrollsets = n(),
+      .groups = "drop"
+    )
+  
+  patient_metrics <- calculate_diagnostic_metrics_raw(patient_pred) %>%
+    mutate(
+      model = model_name,
+      analysis_level = "Patient-level averaged GEE prediction",
+      scaling = "Unscaled"
+    )
+  
+  list(
+    fit = gee_fit,
+    scrollset_predictions = df_pred,
+    patient_predictions = patient_pred,
+    metrics = bind_rows(scrollset_metrics, patient_metrics)
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Run  GEE models
+# ------------------------------------------------------------------------------
+
+gee_results_raw <- purrr::imap(
+  gee_model_features_raw,
+  ~ run_gee_model_raw(
+    df = gee_df_raw,
+    features = .x,
+    model_name = .y
+  )
+)
+
+# ------------------------------------------------------------------------------
+# Raw diagnostic performance table
+# ------------------------------------------------------------------------------
+
+gee_performance_table_raw <- purrr::map_dfr(
+  gee_results_raw,
+  ~ .x$metrics
+) %>%
+  select(
+    scaling,
+    model,
+    analysis_level,
+    auc,
+    sensitivity,
+    specificity,
+    accuracy,
+    ppv,
+    npv,
+    threshold,
+    tp,
+    tn,
+    fp,
+    fn
+  ) %>%
+  mutate(
+    across(
+      c(auc, sensitivity, specificity, accuracy, ppv, npv, threshold),
+      ~ round(.x, 3)
+    )
+  )
+
+cat("\n--- Raw/unscaled GEE diagnostic performance table ---\n")
+print(gee_performance_table_raw, n = Inf)
+
+# ------------------------------------------------------------------------------
+# Print GEE model summaries
+# ------------------------------------------------------------------------------
+
+cat("\n---  GEE model summaries ---\n")
+
+for (model_name in names(gee_results_raw)) {
+  cat("\n\n============================================================\n")
+  cat(model_name, "\n")
+  cat("============================================================\n")
+  print(summary(gee_results_raw[[model_name]]$fit))
+}
+
+# ------------------------------------------------------------------------------
+# Save outputs
+# ------------------------------------------------------------------------------
+
+write.csv(
+  gee_performance_table_raw,
+  file = file.path(
+    gee_output_dir,
+    "GEE_patient_level_diagnostic_performance.csv"
+  ),
+  row.names = FALSE
+)
+
+if (exists("gee_scaling_comparison_table")) {
+  write.csv(
+    gee_scaling_comparison_table,
+    file = file.path(
+      gee_output_dir,
+      "GEE_standardised_vs_unscaled_comparison.csv"
+    ),
+    row.names = FALSE
+  )
+}
+
+cat("\n---GEE outputs saved to: ", gee_output_dir, " ---\n")
+```
+
+```{r}
+# ==============================================================================
+# 15. Within-participant concordance of diagnostic recommendations
+# across multiple scroll-sets from the same participant
+# ==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(pROC)
+
+# ------------------------------------------------------------------------------
+# 1. Define variables needed for the final selected models
+# ------------------------------------------------------------------------------
+
+repro_required_vars <- c(
+  "case_ID",
+  "endoscopy_outcome_binarized",
+  "chr9p",
+  "chr2q",
+  "chr3q",
+  "chr11q",
+  "genome_wide_CNA_burden",
+  "genome_wide_CNA_burden_binary",
+  "cytosponge_definite_sq_atypia",
+  "p53_staining_binarized"
+)
+
+missing_repro_vars <- setdiff(repro_required_vars, names(model_df))
+
+if (length(missing_repro_vars) > 0) {
+  stop(
+    "The following variables are missing from model_df: ",
+    paste(missing_repro_vars, collapse = ", ")
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 2. Prepare complete-case dataframe
+# ------------------------------------------------------------------------------
+
+repro_df <- model_df %>%
+  dplyr::select(all_of(repro_required_vars)) %>%
+  tidyr::drop_na() %>%
+  mutate(
+    outcome_binary = case_when(
+      endoscopy_outcome_binarized == "X1" ~ 1,
+      endoscopy_outcome_binarized == "X0" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    genome_wide_CNA_burden_binary = factor(
+      as.character(genome_wide_CNA_burden_binary),
+      levels = c("Low burden", "High burden")
+    ),
+    cytosponge_definite_sq_atypia = factor(
+      as.character(cytosponge_definite_sq_atypia),
+      levels = c("0", "1")
+    ),
+    p53_staining_binarized = factor(
+      as.character(p53_staining_binarized),
+      levels = c("0", "1")
+    )
+  ) %>%
+  filter(!is.na(outcome_binary))
+
+cat("\n--- Complete-case reproducibility dataset ---\n")
+print(
+  repro_df %>%
+    summarise(
+      n_scrollsets = n(),
+      n_patients = n_distinct(case_ID)
+    )
+)
+
+# ------------------------------------------------------------------------------
+# 3. Keep only participants with multiple scroll-sets
+# ------------------------------------------------------------------------------
+
+multi_scroll_cases <- repro_df %>%
+  count(case_ID, name = "n_scrollsets") %>%
+  filter(n_scrollsets > 1) %>%
+  pull(case_ID)
+
+repro_multi_df <- repro_df %>%
+  filter(case_ID %in% multi_scroll_cases)
+
+cat("\n--- Multi-scroll-set subset ---\n")
+print(
+  repro_multi_df %>%
+    summarise(
+      n_participants_with_multiple_scrollsets = n_distinct(case_ID),
+      n_scrollsets_from_multi_scrollset_participants = n()
+    )
+)
+
+# ------------------------------------------------------------------------------
+# 4. Define final selected models
+# ------------------------------------------------------------------------------
+
+repro_model_features <- list(
+  "Continuous genomic model" = c(
+    "genome_wide_CNA_burden",
+    "chr2q",
+    "chr3q",
+    "chr9p",
+    "chr11q"
+  ),
+  
+  "Binary genomic model" = c(
+    "genome_wide_CNA_burden_binary",
+    "chr2q",
+    "chr3q",
+    "chr9p",
+    "chr11q"
+  ),
+  
+  "Pathology model" = c(
+    "cytosponge_definite_sq_atypia",
+    "p53_staining_binarized"
+  )
+)
+
+# ------------------------------------------------------------------------------
+# 5. Helper functions
+# ------------------------------------------------------------------------------
+
+make_repro_formula <- function(features) {
+  as.formula(
+    paste("outcome_binary ~", paste(features, collapse = " + "))
+  )
+}
+
+get_youden_threshold <- function(truth, pred_prob) {
+  
+  roc_obj <- pROC::roc(
+    response = truth,
+    predictor = pred_prob,
+    levels = c(0, 1),
+    direction = "<",
+    quiet = TRUE
+  )
+  
+  threshold <- pROC::coords(
+    roc_obj,
+    x = "best",
+    best.method = "youden",
+    ret = "threshold",
+    transpose = FALSE
+  )
+  
+  as.numeric(as.data.frame(threshold)$threshold[1])
+}
+
+run_simple_concordance <- function(df_all, df_multi, features, model_name) {
+  
+  # Fit the final model using the complete-case analysis dataset
+  model_fit <- glm(
+    formula = make_repro_formula(features),
+    data = df_all,
+    family = binomial(link = "logit")
+  )
+  
+  # Use fitted probabilities from the complete-case dataset to define threshold
+  df_all_pred <- df_all %>%
+    mutate(
+      pred_prob = as.numeric(
+        predict(model_fit, newdata = df_all, type = "response")
+      )
+    )
+  
+  threshold <- get_youden_threshold(
+    truth = df_all_pred$outcome_binary,
+    pred_prob = df_all_pred$pred_prob
+  )
+  
+  # Apply the same model and threshold to participants with multiple scroll-sets
+  df_multi_pred <- df_multi %>%
+    mutate(
+      pred_prob = as.numeric(
+        predict(model_fit, newdata = df_multi, type = "response")
+      ),
+      pred_class = if_else(pred_prob >= threshold, 1L, 0L)
+    )
+  
+  # Complete concordance:
+  # all scroll-sets from the same participant give the same binary recommendation
+  case_concordance <- df_multi_pred %>%
+    group_by(case_ID) %>%
+    summarise(
+      n_scrollsets = n(),
+      n_distinct_recommendations = n_distinct(pred_class),
+      complete_concordance = n_distinct_recommendations == 1,
+      .groups = "drop"
+    )
+  
+  tibble(
+    model = model_name,
+    threshold = threshold,
+    n_participants_with_multiple_scrollsets = n_distinct(df_multi$case_ID),
+    n_scrollsets_from_multi_scrollset_participants = nrow(df_multi),
+    complete_concordance_n = sum(case_concordance$complete_concordance),
+    complete_concordance_percent = 100 * mean(case_concordance$complete_concordance),
+    discordant_n = sum(!case_concordance$complete_concordance)
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 6. Run  concordance analysis
+# ------------------------------------------------------------------------------
+
+repro_simple_summary <- purrr::imap_dfr(
+  repro_model_features,
+  ~ run_simple_concordance(
+    df_all = repro_df,
+    df_multi = repro_multi_df,
+    features = .x,
+    model_name = .y
+  )
+) %>%
+  mutate(
+    threshold = round(threshold, 3),
+    complete_concordance_percent = round(complete_concordance_percent, 1)
+  )
+
+cat("\n--- Within-participant concordance summary ---\n")
+print(repro_simple_summary, n = Inf, width = Inf)
+
+# ------------------------------------------------------------------------------
+# 7. Export summary table
+# ------------------------------------------------------------------------------
+
+repro_output_dir <- if (exists("data_dir")) data_dir else "."
+
+write.csv(
+  repro_simple_summary,
+  file = file.path(
+    repro_output_dir,
+    "within_participant_scrollset_concordance_summary.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+
+```{r}
+# ==============================================================================
+# 16. Covariate-adjusted feature-wise ORs per SD increase
+#
+# Each model:
+#   outcome_binary ~ one_genomic_feature + age + sex + smoking_status
+# ==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(geepack)
+
+# ------------------------------------------------------------------------------
+# 1. Define required variables
+# ------------------------------------------------------------------------------
+
+adjusted_or_required_vars <- c(
+  "case_ID",
+  "endoscopy_outcome_binarized",
+  "age",
+  "sex",
+  "smoking_binary",
+  "genome_wide_CNA_burden",
+  "chr2q",
+  "chr3q",
+  "chr9p",
+  "chr11q"
+)
+
+missing_adjusted_or_vars <- setdiff(adjusted_or_required_vars, names(model_df))
+
+if (length(missing_adjusted_or_vars) > 0) {
+  stop(
+    "The following variables are missing from model_df: ",
+    paste(missing_adjusted_or_vars, collapse = ", ")
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 2. Prepare dataframe
+# ------------------------------------------------------------------------------
+
+adjusted_or_df <- model_df %>%
+  dplyr::select(all_of(adjusted_or_required_vars)) %>%
+  mutate(
+    outcome_binary = case_when(
+      endoscopy_outcome_binarized == "X1" ~ 1,
+      endoscopy_outcome_binarized == "X0" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    age = as.numeric(age),
+    
+    sex = case_when(
+      as.character(sex) %in% c("F", "Female", "female") ~ "Female",
+      as.character(sex) %in% c("M", "Male", "male") ~ "Male",
+      TRUE ~ as.character(sex)
+    ),
+    sex = factor(
+      sex,
+      levels = c("Female", "Male")
+    ),
+    
+    smoking_status = case_when(
+      as.character(smoking_binary) %in% c("0", "Never", "never", "NEVER") ~ "Never",
+      as.character(smoking_binary) %in% c("1", "Active", "active", "Former", "former", "active/former", "Active/former") ~ "Active/former",
+      TRUE ~ NA_character_
+    ),
+    smoking_status = factor(
+      smoking_status,
+      levels = c("Never", "Active/former")
+    ),
+    
+    cluster_id = as.integer(factor(case_ID))
+  ) %>%
+  filter(!is.na(outcome_binary))
+
+cat("\n--- Adjusted OR dataset before feature-wise complete-case filtering ---\n")
+print(
+  adjusted_or_df %>%
+    summarise(
+      n_scrollsets = n(),
+      n_patients = n_distinct(case_ID),
+      n_IEN_early_cancer_scrollsets = sum(outcome_binary == 1),
+      n_non_IEN_early_cancer_scrollsets = sum(outcome_binary == 0),
+      n_IEN_early_cancer_patients = n_distinct(case_ID[outcome_binary == 1]),
+      n_non_IEN_early_cancer_patients = n_distinct(case_ID[outcome_binary == 0]),
+      n_missing_age = sum(is.na(age)),
+      n_missing_sex = sum(is.na(sex)),
+      n_missing_smoking = sum(is.na(smoking_status))
+    )
+)
+
+# ------------------------------------------------------------------------------
+# 3. Define genomic features
+# ------------------------------------------------------------------------------
+
+genomic_features <- c(
+  "genome_wide_CNA_burden",
+  "chr2q",
+  "chr3q",
+  "chr9p",
+  "chr11q"
+)
+
+genomic_feature_labels <- c(
+  "genome_wide_CNA_burden" = "Genome-wide CNA burden",
+  "chr2q" = "2q arm-level copy-number signal",
+  "chr3q" = "3q arm-level copy-number signal",
+  "chr9p" = "9p arm-level copy-number signal",
+  "chr11q" = "11q arm-level copy-number signal"
+)
+
+# ------------------------------------------------------------------------------
+# 4. Function to fit one feature-wise adjusted GEE model
+# ------------------------------------------------------------------------------
+
+fit_feature_wise_adjusted_or <- function(df, feature_name) {
+  
+  feature_label <- genomic_feature_labels[[feature_name]]
+  
+  feature_model_df <- df %>%
+    dplyr::select(
+      case_ID,
+      cluster_id,
+      outcome_binary,
+      age,
+      sex,
+      smoking_status,
+      all_of(feature_name)
+    ) %>%
+    tidyr::drop_na() %>%
+    mutate(
+      genomic_feature_raw = .data[[feature_name]],
+      genomic_feature_sd = sd(genomic_feature_raw, na.rm = TRUE)
+    ) %>%
+    arrange(cluster_id)
+  
+  cat("\n--- Running feature-wise adjusted model for: ", feature_label, " ---\n")
+  print(
+    feature_model_df %>%
+      summarise(
+        n_scrollsets = n(),
+        n_patients = n_distinct(case_ID),
+        n_IEN_early_cancer_scrollsets = sum(outcome_binary == 1),
+        n_non_IEN_early_cancer_scrollsets = sum(outcome_binary == 0),
+        n_IEN_early_cancer_patients = n_distinct(case_ID[outcome_binary == 1]),
+        n_non_IEN_early_cancer_patients = n_distinct(case_ID[outcome_binary == 0]),
+        feature_sd = first(genomic_feature_sd)
+      )
+  )
+  
+  if (nrow(feature_model_df) == 0) {
+    stop("No complete-case rows available for feature: ", feature_name)
+  }
+  
+  if (n_distinct(feature_model_df$case_ID) != n_distinct(feature_model_df$cluster_id)) {
+    stop("Cluster ID problem for feature: ", feature_name)
+  }
+  
+  feature_formula <- as.formula(
+    paste(
+      "outcome_binary ~",
+      feature_name,
+      "+ age + sex + smoking_status"
+    )
+  )
+  
+  gee_fit <- geepack::geeglm(
+    formula = feature_formula,
+    id = cluster_id,
+    data = feature_model_df,
+    family = binomial(link = "logit"),
+    corstr = "independence",
+    control = geepack::geese.control(maxit = 100)
+  )
+  
+  coef_table <- as.data.frame(summary(gee_fit)$coefficients) %>%
+    tibble::rownames_to_column("term")
+  
+  names(coef_table) <- make.names(names(coef_table))
+  
+  p_col <- grep("^Pr", names(coef_table), value = TRUE)[1]
+  
+  feature_row <- coef_table %>%
+    filter(term == feature_name)
+  
+  raw_estimate <- feature_row$Estimate
+  raw_robust_se <- feature_row$Std.err
+  raw_p_value <- feature_row[[p_col]]
+  feature_sd <- unique(feature_model_df$genomic_feature_sd)
+  
+  log_or_per_sd <- raw_estimate * feature_sd
+  robust_se_per_sd <- raw_robust_se * feature_sd
+  
+  adjusted_or_per_sd <- exp(log_or_per_sd)
+  ci_lower <- exp(log_or_per_sd - 1.96 * robust_se_per_sd)
+  ci_upper <- exp(log_or_per_sd + 1.96 * robust_se_per_sd)
+  
+  tibble(
+    biomarker = feature_label,
+    biomarker_variable = feature_name,
+    scale = "Per 1 SD increase",
+    adjusted_or_per_sd = adjusted_or_per_sd,
+    ci_lower = ci_lower,
+    ci_upper = ci_upper,
+    p_value = raw_p_value,
+    feature_sd = feature_sd,
+    n_scrollsets = nrow(feature_model_df),
+    n_patients = n_distinct(feature_model_df$case_ID),
+    n_IEN_early_cancer_scrollsets = sum(feature_model_df$outcome_binary == 1),
+    n_non_IEN_early_cancer_scrollsets = sum(feature_model_df$outcome_binary == 0),
+    n_IEN_early_cancer_patients = n_distinct(feature_model_df$case_ID[feature_model_df$outcome_binary == 1]),
+    n_non_IEN_early_cancer_patients = n_distinct(feature_model_df$case_ID[feature_model_df$outcome_binary == 0]),
+    adjusted_for = "Age, sex and smoking status",
+    model = "Feature-wise GEE using raw genomic feature values",
+    raw_log_or = raw_estimate,
+    raw_robust_se = raw_robust_se,
+    log_or_per_sd = log_or_per_sd,
+    robust_se_per_sd = robust_se_per_sd
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 5. Run feature-wise adjusted models
+# ------------------------------------------------------------------------------
+
+supplementary_table4_feature_wise <- purrr::map_dfr(
+  genomic_features,
+  ~ fit_feature_wise_adjusted_or(
+    df = adjusted_or_df,
+    feature_name = .x
+  )
+)
+
+# ------------------------------------------------------------------------------
+# 6. Format Supplementary Table 4
+# ------------------------------------------------------------------------------
+
+supplementary_table4_feature_wise_formatted <- supplementary_table4_feature_wise %>%
+  mutate(
+    adjusted_or_95ci = paste0(
+      sprintf("%.2f", adjusted_or_per_sd),
+      " (",
+      sprintf("%.2f", ci_lower),
+      "–",
+      sprintf("%.2f", ci_upper),
+      ")"
+    ),
+    p_value_fmt = case_when(
+      is.na(p_value) ~ NA_character_,
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    ),
+    feature_sd = round(feature_sd, 4)
+  ) %>%
+  dplyr::select(
+    biomarker,
+    scale,
+    adjusted_or_95ci,
+    p_value = p_value_fmt,
+    feature_sd,
+    n_scrollsets,
+    n_patients,
+    n_IEN_early_cancer_scrollsets,
+    n_non_IEN_early_cancer_scrollsets,
+    n_IEN_early_cancer_patients,
+    n_non_IEN_early_cancer_patients,
+    adjusted_for,
+    model,
+    biomarker_variable,
+    raw_log_or,
+    raw_robust_se,
+    log_or_per_sd,
+    robust_se_per_sd
+  )
+
+cat("\n--- Supplementary Table 4: Feature-wise covariate-adjusted ORs per SD increase ---\n")
+print(supplementary_table4_feature_wise_formatted, n = Inf, width = Inf)
+# ------------------------------------------------------------------------------
+# 7. Save Supplementary Table 4
+# ------------------------------------------------------------------------------
+
+supp_table4_output_dir <- if (exists("data_dir")) data_dir else "."
+
+write.csv(
+  supplementary_table4_feature_wise_formatted,
+  file = file.path(
+    supp_table4_output_dir,
+    "Supplementary_Table4_feature_wise_covariate_adjusted_ORs_per_SD.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("\nSaved Supplementary Table 4 to: ", supp_table4_output_dir, "\n")
+```
+
+
+```{r}
+# =============================================================
+# Extended Data Figure: all chromosome-arm bubble plot
+# Relative copy-number signal across all chromosome arms
+# =============================================================
+
+# --- Libraries ---
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(scales)
+
+# --- Chromosome arm order ---
+chromosomal_arm_order <- c(
+  "chr1p", "chr1q",
+  "chr2p", "chr2q",
+  "chr3p", "chr3q",
+  "chr4p", "chr4q",
+  "chr5p", "chr5q",
+  "chr6p", "chr6q",
+  "chr7p", "chr7q",
+  "chr8p", "chr8q",
+  "chr9p", "chr9q",
+  "chr10p", "chr10q",
+  "chr11p", "chr11q",
+  "chr12p", "chr12q",
+  "chr13q",
+  "chr14q",
+  "chr15q",
+  "chr16p", "chr16q",
+  "chr17p", "chr17q",
+  "chr18p", "chr18q",
+  "chr19p", "chr19q",
+  "chr20p", "chr20q",
+  "chr21q",
+  "chr22q"
+)
+
+spec_order_df_allarms <- arm_level_annot %>%
+  mutate(
+    original_row_order = row_number(),
+    group = case_when(
+      as.character(endoscopy_outcome_trichotomize) == "0" ~ "Normal",
+      as.character(endoscopy_outcome_trichotomize) == "0.5" ~ "Benign",
+      as.character(endoscopy_outcome_trichotomize) == "1" ~ "IEN/early cancer",
+      as.character(endoscopy_outcome_trichotomize) == "Normal" ~ "Normal",
+      as.character(endoscopy_outcome_trichotomize) == "Benign" ~ "Benign",
+      as.character(endoscopy_outcome_trichotomize) == "IEN/early cancer" ~ "IEN/early cancer",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(group)) %>%
+  distinct(specimen_ID, group, .keep_all = TRUE) %>%
+  mutate(
+    group = factor(group, levels = c("Normal", "Benign", "IEN/early cancer"))
+  ) %>%
+  arrange(group, original_row_order) %>%
+  mutate(
+    specimen_ID = factor(specimen_ID, levels = unique(specimen_ID))
+  ) %>%
+  dplyr::select(specimen_ID, group)
+
+# --- Prepare all-arm plotting dataframe ---
+all_arm_bubble_df <- arm_level_annot %>%
+  mutate(
+    group = case_when(
+      as.character(endoscopy_outcome_trichotomize) == "0" ~ "Normal",
+      as.character(endoscopy_outcome_trichotomize) == "0.5" ~ "Benign",
+      as.character(endoscopy_outcome_trichotomize) == "1" ~ "IEN/early cancer",
+      as.character(endoscopy_outcome_trichotomize) == "Normal" ~ "Normal",
+      as.character(endoscopy_outcome_trichotomize) == "Benign" ~ "Benign",
+      as.character(endoscopy_outcome_trichotomize) == "IEN/early cancer" ~ "IEN/early cancer",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(group),
+    chromosomal_arm %in% chromosomal_arm_order
+  ) %>%
+  mutate(
+    chromosomal_arm = factor(chromosomal_arm, levels = chromosomal_arm_order),
+    group = factor(group, levels = c("Normal", "Benign", "IEN/early cancer"))
+  ) %>%
+  left_join(
+    spec_order_df_allarms,
+    by = c("specimen_ID", "group")
+  ) %>%
+  mutate(
+    specimen_ID = factor(specimen_ID, levels = levels(spec_order_df_allarms$specimen_ID))
+  )
+
+# --- Quick checks ---
+cat("
+--- All-arm bubble plot dataframe checks ---
+")
+cat("Number of rows:
+")
+print(nrow(all_arm_bubble_df))
+
+cat("
+Outcome group counts based on specimen IDs:
+")
+print(
+  all_arm_bubble_df %>%
+    distinct(specimen_ID, group) %>%
+    count(group, name = "n_specimens"),
+  n = Inf
+)
+
+cat("
+Number of unique specimens:
+")
+print(length(unique(all_arm_bubble_df$specimen_ID)))
+
+cat("
+Number of unique chromosome arms:
+")
+print(length(unique(all_arm_bubble_df$chromosomal_arm)))
+
+# --- Plot ---
+extended_all_arm_bubbles <- ggplot(
+  all_arm_bubble_df,
+  aes(
+    x = chromosomal_arm,
+    y = specimen_ID,
+    size = pmin(0.35, abs(segmented_CN)),
+    fill = segmented_CN
+  )
+) +
+  geom_point(
+    shape = 21,
+    colour = "grey20",
+    stroke = 0.18,
+    alpha = 0.9
+  ) +
+  facet_wrap(
+    ~ group,
+    scales = "free_y",
+    ncol = 1
+  ) +
+  scale_size_continuous(
+    range = c(1.1, 5.8),
+    breaks = c(0.05, 0.10, 0.20),
+    labels = c("0.05", "0.10", "0.20"),
+    name = "|log2 CN|"
+  ) +
+  scale_fill_gradient2(
+    low = "#3B74B2",
+    mid = "white",
+    high = "#C33C3C",
+    midpoint = 0,
+    limits = c(-0.2, 0.2),
+    oob = scales::squish,
+    name = "Relative copy number (log2)"
+  ) +
+  labs(
+    title = NULL,
+    x = "Chromosome arm",
+    y = "Capsule sponge specimens"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    panel.spacing.y = unit(0.35, "lines"),
+    axis.ticks.x = element_line(colour = "grey80", linewidth = 0.25),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(
+      angle = 90,
+      vjust = 0.5,
+      hjust = 1,
+      size = 9,
+      colour = "grey20"
+    ),
+    axis.text.y = element_blank(),
+    axis.title.x = element_text(face = "bold", size = 9, margin = margin(t = 5)),
+    axis.title.y = element_text(face = "bold", size = 9, margin = margin(r = 5)),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.box.just = "left",
+    legend.title.align = 0,
+    legend.spacing.y = unit(2, "mm"),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.title = element_text(face = "bold", size = 9),
+    legend.text = element_text(size = 9)
+  ) +
+  scale_y_discrete(expand = expansion(mult = c(0.03, 0.03))) +
+  scale_x_discrete(expand = expansion(add = c(0.5, 0.5))) +
+  guides(
+    fill = guide_colourbar(
+      order = 1,
+      title.position = "top",
+      title.hjust = 0,
+      label.position = "right",
+      label.hjust = 0,
+      barwidth = unit(2.2, "mm"),
+      barheight = unit(16, "mm"),
+      ticks = FALSE
+    ),
+    size = guide_legend(
+      order = 2,
+      title.position = "top",
+      title.hjust = 0,
+      label.hjust = 0,
+      keywidth = unit(2.2, "mm"),
+      keyheight = unit(2.2, "mm"),
+      override.aes = list(stroke = 0.18, alpha = 0.9)
+    )
+  )
+
+print(extended_all_arm_bubbles)
+
+# --- Save ---
+ggsave(
+  file.path(fig_dir, "ExtendedData_figure3.pdf"),
+  extended_all_arm_bubbles,
+  width = 10,
+  height = 9,
+  units = "in",
+  dpi = 600,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(fig_dir, "ExtendedData_figure3.png"),
+  extended_all_arm_bubbles,
+  width = 10,
+  height = 9,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+
+if (requireNamespace("BiocManager", quietly = TRUE)) {
+  BiocManager::version()
+}
+```
+

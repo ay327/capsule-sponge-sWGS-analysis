@@ -1,0 +1,2 @@
+sequencing_ID	specimen_ID	case_ID	age	sex	bmi	chest_rth	group	endoscopy_outcome_binarized	endoscopy_outcome_trichotomize	cytosponge_definite_sq_atypia	p53_staining_binarized	smoking_binary
+SLX-DEMO.001	SPECIMEN_DEMO_001	PARTICIPANT_DEMO_001	60	F	25.0	0	control	0	0	0	0	0
