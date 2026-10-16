@@ -47,3 +47,16 @@ bedtools intersect \
   -b cytoBand_armLevel_vo1.bed \
   -loj \
   > S03_50kb_bins_arminfo.txt
+```
+
+## Downstream analysis inputs
+
+The resulting  files required by the downstream analyses are:
+
+- `data/capsule_sponge_50kb_segmented.tsv`
+- `data/clinical_metadata.tsv`
+- `data/esd_segments.tsv`
+
+These participant-derived files are not distributed through the public GitHub
+repository and are subject to the controlled-access procedure described in the
+manuscript Data Availability statement.

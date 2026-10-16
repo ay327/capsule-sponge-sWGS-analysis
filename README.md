@@ -20,6 +20,9 @@ squamous cancer**
 - `data/example/`
   - Synthetic schema examples only. These are not study data and cannot be used
     to reproduce the reported results.
+- `PREPROCESSING.md`
+  - Summary of the upstream sequencing and copy-number preprocessing workflow
+    used to generate the analysis-ready input files.
 - `PARAMETERS.md`
   - Key analysis settings and model parameters.
 - `environment/`
