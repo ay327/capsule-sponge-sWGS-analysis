@@ -89,8 +89,8 @@ Exact R and package versions used for the final analysis are provided in
 ## Citation
 
 The version of the code corresponding to the published manuscript is archived
-in a DOI-providing repository.
+in Zenodo.
 
 GitHub: https://github.com/ay327/capsule-sponge-sWGS-analysis
 
-Archived release: [ADD FINAL DOI / REPOSITORY CITATION]
+Archived release: https://doi.org/10.5281/zenodo.23423132
