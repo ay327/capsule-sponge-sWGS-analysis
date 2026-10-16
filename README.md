@@ -85,3 +85,12 @@ Outputs from this analysis are written to:
 Exact R and package versions used for the final analysis are provided in
 `environment/sessionInfo.txt`. Additional information is provided in
 `environment/README.md`.
+
+## Citation
+
+The version of the code corresponding to the published manuscript is archived
+in a DOI-providing repository.
+
+GitHub: https://github.com/ay327/capsule-sponge-sWGS-analysis
+
+Archived release: [ADD FINAL DOI / REPOSITORY CITATION]
